@@ -19,8 +19,13 @@ package org.apache.spark.sql.execution.streaming.state
 
 import java.io._
 import java.nio.charset.Charset
+import java.util.concurrent.Executors
 
+import scala.collection.mutable
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration._
 import scala.language.implicitConversions
+import scala.util.Random
 
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
@@ -29,7 +34,7 @@ import org.rocksdb.CompressionType
 import org.scalactic.source.Position
 import org.scalatest.Tag
 
-import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.util.quietly
 import org.apache.spark.sql.execution.streaming.{CreateAtomicTestManager, FileSystemBasedCheckpointFileManager}
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager.{CancellableFSDataOutputStream, RenameBasedFSDataOutputStream}
@@ -197,16 +202,16 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
     }
     checkError(
       ex,
-      errorClass = "CANNOT_LOAD_STATE_STORE.UNCATEGORIZED",
-      parameters = Map.empty
+      condition = "CANNOT_LOAD_STATE_STORE.UNEXPECTED_VERSION",
+      parameters = Map("version" -> "-1")
     )
     ex = intercept[SparkException] {
       provider.getReadStore(-1)
     }
     checkError(
       ex,
-      errorClass = "CANNOT_LOAD_STATE_STORE.UNCATEGORIZED",
-      parameters = Map.empty
+      condition = "CANNOT_LOAD_STATE_STORE.UNEXPECTED_VERSION",
+      parameters = Map("version" -> "-1")
     )
 
     val remoteDir = Utils.createTempDir().toString
@@ -217,7 +222,7 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
       }
       checkError(
         ex,
-        errorClass = "CANNOT_LOAD_STATE_STORE.CANNOT_READ_STREAMING_STATE_FILE",
+        condition = "CANNOT_LOAD_STATE_STORE.CANNOT_READ_STREAMING_STATE_FILE",
         parameters = Map(
           "fileToRead" -> s"$remoteDir/1.changelog"
         )
@@ -226,12 +231,12 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
   }
 
   testWithColumnFamilies(
-    "RocksDB: purge changelog and snapshots",
+    "RocksDB: purge changelog and snapshots with minVersionsToDelete = 0",
     TestWithChangelogCheckpointingEnabled) { colFamiliesEnabled =>
     val remoteDir = Utils.createTempDir().toString
     new File(remoteDir).delete() // to make sure that the directory gets created
     val conf = dbConf.copy(enableChangelogCheckpointing = true,
-      minVersionsToRetain = 3, minDeltasForSnapshot = 1)
+      minVersionsToRetain = 3, minDeltasForSnapshot = 1, minVersionsToDelete = 0)
     withDB(remoteDir, conf = conf, useColumnFamilies = colFamiliesEnabled) { db =>
       db.load(0)
       db.commit()
@@ -268,6 +273,51 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
   }
 
   testWithColumnFamilies(
+    "RocksDB: purge version files with minVersionsToDelete > 0",
+    TestWithBothChangelogCheckpointingEnabledAndDisabled) { colFamiliesEnabled =>
+    val remoteDir = Utils.createTempDir().toString
+    new File(remoteDir).delete() // to make sure that the directory gets created
+    val conf = dbConf.copy(
+      minVersionsToRetain = 3, minDeltasForSnapshot = 1, minVersionsToDelete = 3)
+    withDB(remoteDir, conf = conf, useColumnFamilies = colFamiliesEnabled) { db =>
+      // Commit 5 versions
+      // stale versions: (1, 2)
+      // keep versions: (3, 4, 5)
+      for (version <- 0 to 4) {
+        // Should upload latest snapshot but not delete any files
+        // since number of stale versions < minVersionsToDelete
+        db.load(version)
+        db.commit()
+        db.doMaintenance()
+      }
+
+      // Commit 1 more version
+      // stale versions: (1, 2, 3)
+      // keep versions: (4, 5, 6)
+      db.load(5)
+      db.commit()
+
+      // Checkpoint directory before maintenance
+      if (isChangelogCheckpointingEnabled) {
+        assert(snapshotVersionsPresent(remoteDir) == (1 to 5))
+        assert(changelogVersionsPresent(remoteDir) == (1 to 6))
+      } else {
+        assert(snapshotVersionsPresent(remoteDir) == (1 to 6))
+      }
+
+      // Should delete stale versions for zip files and change log files
+      // since number of stale versions >= minVersionsToDelete
+      db.doMaintenance()
+
+      // Checkpoint directory after maintenance
+      assert(snapshotVersionsPresent(remoteDir) == Seq(4, 5, 6))
+      if (isChangelogCheckpointingEnabled) {
+        assert(changelogVersionsPresent(remoteDir) == Seq(4, 5, 6))
+      }
+    }
+  }
+
+  testWithColumnFamilies(
     "RocksDB: minDeltasForSnapshot",
     TestWithChangelogCheckpointingEnabled) { colFamiliesEnabled =>
     val remoteDir = Utils.createTempDir().toString
@@ -287,25 +337,34 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
       db.doMaintenance()
       assert(snapshotVersionsPresent(remoteDir) === Seq(3))
       db.load(3)
-      for (i <- 1 to 10001) {
-        db.put(i.toString, i.toString)
-      }
-      db.commit()
-      db.doMaintenance()
-      // Snapshot should be created this time because the size of the change log > 1000
-      assert(snapshotVersionsPresent(remoteDir) === Seq(3, 4))
-      for (version <- 4 to 7) {
+
+      for (version <- 3 to 7) {
         db.load(version)
         db.commit()
         db.doMaintenance()
       }
-      assert(snapshotVersionsPresent(remoteDir) === Seq(3, 4, 7))
-      for (version <- 8 to 20) {
+      assert(snapshotVersionsPresent(remoteDir) === Seq(3, 6))
+      for (version <- 8 to 17) {
         db.load(version)
         db.commit()
       }
       db.doMaintenance()
-      assert(snapshotVersionsPresent(remoteDir) === Seq(3, 4, 7, 19))
+      assert(snapshotVersionsPresent(remoteDir) === Seq(3, 6, 18))
+    }
+
+    // pick up from the last snapshot and the next upload will be for version 21
+    withDB(remoteDir, conf = conf) { db =>
+      db.load(18)
+      db.commit()
+      db.doMaintenance()
+      assert(snapshotVersionsPresent(remoteDir) === Seq(3, 6, 18))
+
+      for (version <- 19 to 20) {
+        db.load(version)
+        db.commit()
+      }
+      db.doMaintenance()
+      assert(snapshotVersionsPresent(remoteDir) === Seq(3, 6, 18, 21))
     }
   }
 
@@ -381,6 +440,14 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
       for (version <- 1 to 60) {
         db.load(version, readOnly = true)
         assert(db.iterator().map(toStr).toSet === Set((version.toString, version.toString)))
+      }
+
+      // recommit 60 to ensure that acquireLock is released for maintenance
+      for (version <- 60 to 60) {
+        db.load(version - 1)
+        db.put(version.toString, version.toString)
+        db.remove((version - 1).toString)
+        db.commit()
       }
       // Check that snapshots and changelogs get purged correctly.
       db.doMaintenance()
@@ -535,123 +602,6 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
     }
   }
 
-  testWithColumnFamilies(s"RocksDB: get, put, iterator, commit, load " +
-    s"with multiple column families",
-    TestWithBothChangelogCheckpointingEnabledAndDisabled) { colFamiliesEnabled =>
-    val remoteDir = Utils.createTempDir().toString
-    new File(remoteDir).delete() // to make sure that the directory gets created
-    val colFamily1: String = "abc"
-    val colFamily2: String = "xyz"
-
-    val conf = RocksDBConf().copy()
-    withDB(remoteDir, conf = conf, useColumnFamilies = true) { db =>
-      val ex = intercept[Exception] {
-        db.createColFamilyIfAbsent("default")
-      }
-      ex.getCause.isInstanceOf[UnsupportedOperationException]
-    }
-
-    withDB(remoteDir, conf = conf, useColumnFamilies = true) { db =>
-      db.createColFamilyIfAbsent(colFamily1)
-      db.createColFamilyIfAbsent(colFamily2)
-
-      assert(db.get("a", colFamily1) === null)
-      assert(iterator(db, colFamily1).isEmpty)
-
-      db.put("a", "1", colFamily1)
-      assert(toStr(db.get("a", colFamily1)) === "1")
-
-      assert(db.get("a", colFamily2) === null)
-      assert(iterator(db, colFamily2).isEmpty)
-
-      db.put("a", "1", colFamily2)
-      assert(toStr(db.get("a", colFamily2)) === "1")
-
-      db.commit()
-    }
-
-    withDB(remoteDir, conf = conf, version = 0, useColumnFamilies = true) { db =>
-      val ex = intercept[Exception] {
-        // version 0 can be loaded again
-        assert(toStr(db.get("a", colFamily1)) === null)
-        assert(iterator(db, colFamily1).isEmpty)
-
-        // version 0 can be loaded again
-        assert(toStr(db.get("a", colFamily2)) === null)
-        assert(iterator(db, colFamily2).isEmpty)
-      }
-      assert(ex.isInstanceOf[RuntimeException])
-      assert(ex.getMessage.contains("does not exist"))
-    }
-
-    withDB(remoteDir, conf = conf, version = 1, useColumnFamilies = true) { db =>
-      // version 1 data recovered correctly
-      assert(toStr(db.get("a", colFamily1)) === "1")
-      assert(db.iterator(colFamily1).map(toStr).toSet === Set(("a", "1")))
-
-      // make changes but do not commit version 2
-      db.put("b", "2", colFamily1)
-      assert(toStr(db.get("b", colFamily1)) === "2")
-      assert(db.iterator(colFamily1).map(toStr).toSet === Set(("a", "1"), ("b", "2")))
-
-      // version 1 data recovered correctly
-      assert(toStr(db.get("a", colFamily2)) === "1")
-      assert(db.iterator(colFamily2).map(toStr).toSet === Set(("a", "1")))
-
-      // make changes but do not commit version 2
-      db.put("b", "2", colFamily2)
-      assert(toStr(db.get("b", colFamily2)) === "2")
-      assert(db.iterator(colFamily2).map(toStr).toSet === Set(("a", "1"), ("b", "2")))
-    }
-
-    withDB(remoteDir, conf = conf, version = 1, useColumnFamilies = true) { db =>
-      // version 1 data not changed
-      assert(toStr(db.get("a", colFamily1)) === "1")
-      assert(db.get("b", colFamily1) === null)
-      assert(db.iterator(colFamily1).map(toStr).toSet === Set(("a", "1")))
-
-      assert(toStr(db.get("a", colFamily2)) === "1")
-      assert(db.get("b", colFamily2) === null)
-      assert(db.iterator(colFamily2).map(toStr).toSet === Set(("a", "1")))
-
-      // commit version 2
-      db.put("b", "2", colFamily1)
-      assert(toStr(db.get("b", colFamily1)) === "2")
-      assert(db.iterator(colFamily1).map(toStr).toSet === Set(("a", "1"), ("b", "2")))
-
-      db.put("b", "2", colFamily2)
-      assert(toStr(db.get("b", colFamily2)) === "2")
-      db.commit()
-      assert(db.iterator(colFamily2).map(toStr).toSet === Set(("a", "1"), ("b", "2")))
-    }
-
-    withDB(remoteDir, conf = conf, version = 1, useColumnFamilies = true) { db =>
-      // version 1 data not changed
-      assert(toStr(db.get("a", colFamily1)) === "1")
-      assert(db.get("b", colFamily1) === null)
-
-      assert(toStr(db.get("a", colFamily2)) === "1")
-      assert(db.get("b", colFamily2) === null)
-    }
-
-    withDB(remoteDir, conf = conf, version = 2, useColumnFamilies = true) { db =>
-      // version 2 can be loaded again
-      assert(toStr(db.get("b", colFamily1)) === "2")
-      assert(db.iterator(colFamily1).map(toStr).toSet === Set(("a", "1"), ("b", "2")))
-
-      assert(toStr(db.get("b", colFamily2)) === "2")
-      assert(db.iterator(colFamily2).map(toStr).toSet === Set(("a", "1"), ("b", "2")))
-
-      db.load(1)
-      assert(toStr(db.get("b", colFamily1)) === null)
-      assert(db.iterator(colFamily1).map(toStr).toSet === Set(("a", "1")))
-
-      db.load(1)
-      assert(toStr(db.get("b", colFamily2)) === null)
-      assert(db.iterator(colFamily2).map(toStr).toSet === Set(("a", "1")))
-    }
-  }
-
   testWithColumnFamilies(s"RocksDB: handle commit failures and aborts",
     TestWithBothChangelogCheckpointingEnabledAndDisabled) { colFamiliesEnabled =>
     val hadoopConf = new Configuration()
@@ -689,39 +639,88 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
     }
   }
 
+  testWithColumnFamilies("RocksDB close tests - close before doMaintenance",
+    TestWithBothChangelogCheckpointingEnabledAndDisabled) { colFamiliesEnabled =>
+    val remoteDir = Utils.createTempDir().toString
+    val conf = dbConf.copy(minDeltasForSnapshot = 1, compactOnCommit = false)
+    new File(remoteDir).delete() // to make sure that the directory gets created
+    withDB(remoteDir, conf = conf,
+      useColumnFamilies = colFamiliesEnabled) { db =>
+      db.load(0)
+      db.put("foo", "bar")
+      db.commit()
+      // call close first and maintenance can be still be invoked in the context of the
+      // maintenance task's thread pool
+      db.close()
+      db.doMaintenance()
+    }
+  }
+
+  testWithColumnFamilies("RocksDB close tests - close after doMaintenance",
+    TestWithBothChangelogCheckpointingEnabledAndDisabled) { colFamiliesEnabled =>
+    val remoteDir = Utils.createTempDir().toString
+    val conf = dbConf.copy(minDeltasForSnapshot = 1, compactOnCommit = false)
+    new File(remoteDir).delete() // to make sure that the directory gets created
+    withDB(remoteDir, conf = conf,
+      useColumnFamilies = colFamiliesEnabled) { db =>
+      db.load(0)
+      db.put("foo", "bar")
+      db.commit()
+      // maintenance can be invoked in the context of the maintenance task's thread pool
+      // and close is invoked after that
+      db.doMaintenance()
+      db.close()
+    }
+  }
+
   testWithChangelogCheckpointingEnabled("RocksDB: Unsupported Operations" +
     " with Changelog Checkpointing") {
     val dfsRootDir = new File(Utils.createTempDir().getAbsolutePath + "/state/1/1")
     val fileManager = new RocksDBFileManager(
       dfsRootDir.getAbsolutePath, Utils.createTempDir(), new Configuration)
     val changelogWriter = fileManager.getChangeLogWriter(1)
+    assert(changelogWriter.version === 1)
 
-    val ex1 = intercept[SparkUnsupportedOperationException] {
-      changelogWriter.put("a", "1", "testColFamily")
+    val ex = intercept[UnsupportedOperationException] {
+      changelogWriter.merge("a", "1")
     }
 
-    checkError(
-      ex1,
-      errorClass = "STATE_STORE_UNSUPPORTED_OPERATION",
-      parameters = Map(
-        "operationType" -> "Put",
-        "entity" -> "changelog writer v1"
-      ),
-      matchPVals = true
-    )
-    val ex2 = intercept[SparkUnsupportedOperationException] {
-      changelogWriter.delete("a", "testColFamily")
-    }
+    assert(ex.getMessage.contains("state changelog writer v1"))
+  }
 
-    checkError(
-      ex2,
-      errorClass = "STATE_STORE_UNSUPPORTED_OPERATION",
-      parameters = Map(
-        "operationType" -> "Delete",
-        "entity" -> "changelog writer v1"
-      ),
-      matchPVals = true
-    )
+  testWithChangelogCheckpointingEnabled("RocksDBFileManager: " +
+    "background snapshot upload doesn't acquire RocksDB instance lock") {
+    // Create a custom ExecutionContext
+    implicit val ec: ExecutionContext = ExecutionContext
+      .fromExecutor(Executors.newSingleThreadExecutor())
+
+    val remoteDir = Utils.createTempDir().toString
+    val conf = dbConf.copy(lockAcquireTimeoutMs = 10000, minDeltasForSnapshot = 0)
+    new File(remoteDir).delete() // to make sure that the directory gets created
+
+    withDB(remoteDir, conf = conf) { db =>
+      db.load(0)
+      db.put("0", "0")
+      db.commit()
+
+      // Acquire lock
+      db.load(1)
+      db.put("1", "1")
+
+      // Run doMaintenance in another thread
+      val maintenanceFuture = Future {
+        db.doMaintenance()
+      }
+
+      val timeout = 5.seconds
+
+      // Ensure that maintenance task runs without being blocked by task thread
+      ThreadUtils.awaitResult(maintenanceFuture, timeout)
+      assert(snapshotVersionsPresent(remoteDir) == Seq(1))
+
+      // Release lock
+      db.commit()
+    }
   }
 
   testWithChangelogCheckpointingEnabled("RocksDBFileManager: read and write changelog") {
@@ -729,12 +728,14 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
     val fileManager = new RocksDBFileManager(
       dfsRootDir.getAbsolutePath, Utils.createTempDir(), new Configuration)
     val changelogWriter = fileManager.getChangeLogWriter(1)
+    assert(changelogWriter.version === 1)
 
     (1 to 5).foreach(i => changelogWriter.put(i.toString, i.toString))
     (2 to 4).foreach(j => changelogWriter.delete(j.toString))
 
     changelogWriter.commit()
     val changelogReader = fileManager.getChangelogReader(1)
+    assert(changelogReader.version === 1)
     val entries = changelogReader.toSeq
     val expectedEntries = (1 to 5).map { i =>
       (RecordType.PUT_RECORD, i.toString.getBytes,
@@ -746,8 +747,7 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
 
     assert(entries.size == expectedEntries.size)
     entries.zip(expectedEntries).map{
-      case (e1, e2) => assert(e1._1 === e2._1 && e1._2 === e2._2 &&
-        e1._3 === e2._3 && e1._4 === e2._4)
+      case (e1, e2) => assert(e1._1 === e2._1 && e1._2 === e2._2 && e1._3 === e2._3)
     }
   }
 
@@ -757,70 +757,33 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
     val fileManager = new RocksDBFileManager(
       dfsRootDir.getAbsolutePath, Utils.createTempDir(), new Configuration)
     val changelogWriter = fileManager.getChangeLogWriter(1, true)
+    assert(changelogWriter.version === 2)
     (1 to 5).foreach { i =>
-      changelogWriter.put(i.toString, i.toString, StateStore.DEFAULT_COL_FAMILY_NAME)
+      changelogWriter.put(i.toString, i.toString)
+    }
+    (1 to 5).foreach { i =>
+      changelogWriter.merge(i.toString, i.toString)
     }
 
     (2 to 4).foreach { j =>
-      changelogWriter.delete(j.toString, StateStore.DEFAULT_COL_FAMILY_NAME)
+      changelogWriter.delete(j.toString)
     }
 
     changelogWriter.commit()
     val changelogReader = fileManager.getChangelogReader(1, true)
+    assert(changelogReader.version === 2)
     val entries = changelogReader.toSeq
     val expectedEntries = (1 to 5).map { i =>
-      (RecordType.PUT_RECORD, i.toString.getBytes,
-        i.toString.getBytes, StateStore.DEFAULT_COL_FAMILY_NAME)
+      (RecordType.PUT_RECORD, i.toString.getBytes, i.toString.getBytes)
+    } ++ (1 to 5).map { i =>
+      (RecordType.MERGE_RECORD, i.toString.getBytes, i.toString.getBytes)
     } ++ (2 to 4).map { j =>
-      (RecordType.DELETE_RECORD, j.toString.getBytes,
-        null, StateStore.DEFAULT_COL_FAMILY_NAME)
+      (RecordType.DELETE_RECORD, j.toString.getBytes, null)
     }
 
     assert(entries.size == expectedEntries.size)
     entries.zip(expectedEntries).map{
-      case (e1, e2) => assert(e1._1 === e2._1 && e1._2 === e2._2 &&
-        e1._3 === e2._3 && e1._4 === e2._4)
-    }
-  }
-
-  testWithChangelogCheckpointingEnabled(
-    "RocksDBFileManager: read and write v2 changelog with multiple col families") {
-    val dfsRootDir = new File(Utils.createTempDir().getAbsolutePath + "/state/1/1")
-    val testColFamily1: String = "testColFamily1"
-    val testColFamily2: String = "testColFamily2"
-    val fileManager = new RocksDBFileManager(
-      dfsRootDir.getAbsolutePath, Utils.createTempDir(), new Configuration)
-    val changelogWriter = fileManager.getChangeLogWriter(1, true)
-    (1 to 5).foreach(i => changelogWriter.put(i.toString, i.toString, testColFamily1))
-    (2 to 4).foreach(j => changelogWriter.delete(j.toString, testColFamily1))
-
-    (1 to 5).foreach(i => changelogWriter.put(i.toString, i.toString, testColFamily2))
-    (2 to 4).foreach(j => changelogWriter.delete(j.toString, testColFamily2))
-
-    changelogWriter.commit()
-    val changelogReader = fileManager.getChangelogReader(1, true)
-    val entries = changelogReader.toSeq
-    val expectedEntriesForColFamily1 = (1 to 5).map { i =>
-      (RecordType.PUT_RECORD, i.toString.getBytes,
-        i.toString.getBytes, testColFamily1)
-    } ++ (2 to 4).map { j =>
-      (RecordType.DELETE_RECORD, j.toString.getBytes,
-        null, testColFamily1)
-    }
-
-    val expectedEntriesForColFamily2 = (1 to 5).map { i =>
-      (RecordType.PUT_RECORD, i.toString.getBytes,
-        i.toString.getBytes, testColFamily2)
-    } ++ (2 to 4).map { j =>
-      (RecordType.DELETE_RECORD, j.toString.getBytes,
-        null, testColFamily2)
-    }
-
-    val expectedEntries = expectedEntriesForColFamily1 ++ expectedEntriesForColFamily2
-    assert(entries.size == expectedEntries.size)
-    entries.zip(expectedEntries).map{
-      case (e1, e2) => assert(e1._1 === e2._1 && e1._2 === e2._2 &&
-        e1._3 === e2._3 && e1._4 === e2._4)
+      case (e1, e2) => assert(e1._1 === e2._1 && e1._2 === e2._2 && e1._3 === e2._3)
     }
   }
 
@@ -842,6 +805,42 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
       loadAndVerifyCheckpointFiles(fileManager, verificationDir, version = 1, Nil, -1)
     } finally {
       Utils.deleteRecursively(dfsRootDir)
+    }
+  }
+
+  test("RocksDB: ensure merge operation correctness") {
+    withTempDir { dir =>
+      val remoteDir = Utils.createTempDir().toString
+      // minDeltasForSnapshot being 5 ensures that only changelog files are created
+      // for the 3 commits below
+      val conf = dbConf.copy(minDeltasForSnapshot = 5, compactOnCommit = false)
+      new File(remoteDir).delete() // to make sure that the directory gets created
+      withDB(remoteDir, conf = conf, useColumnFamilies = true) { db =>
+        db.load(0)
+        db.put("a", "1")
+        db.merge("a", "2")
+        db.commit()
+
+        db.load(1)
+        db.merge("a", "3")
+        db.commit()
+
+        db.load(2)
+        db.remove("a")
+        db.commit()
+
+        db.load(1)
+        assert(new String(db.get("a")) === "1,2")
+        assert(db.iterator().map(toStr).toSet === Set(("a", "1,2")))
+
+        db.load(2)
+        assert(new String(db.get("a")) === "1,2,3")
+        assert(db.iterator().map(toStr).toSet === Set(("a", "1,2,3")))
+
+        db.load(3)
+        assert(db.get("a") === null)
+        assert(db.iterator().isEmpty)
+      }
     }
   }
 
@@ -1108,9 +1107,10 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
         }
         checkError(
           ex,
-          errorClass = "CANNOT_LOAD_STATE_STORE.UNRELEASED_THREAD_ERROR",
+          condition = "CANNOT_LOAD_STATE_STORE.UNRELEASED_THREAD_ERROR",
           parameters = Map(
             "loggingId" -> "\\[Thread-\\d+\\]",
+            "operationType" -> "load_store",
             "newAcquiredThreadInfo" -> "\\[ThreadId: Some\\(\\d+\\)\\]",
             "acquiredThreadInfo" -> "\\[ThreadId: Some\\(\\d+\\)\\]",
             "timeWaitedMs" -> "\\d+",
@@ -1135,9 +1135,10 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
         }
         checkError(
           ex,
-          errorClass = "CANNOT_LOAD_STATE_STORE.UNRELEASED_THREAD_ERROR",
+          condition = "CANNOT_LOAD_STATE_STORE.UNRELEASED_THREAD_ERROR",
           parameters = Map(
             "loggingId" -> "\\[Thread-\\d+\\]",
+            "operationType" -> "load_store",
             "newAcquiredThreadInfo" -> "\\[ThreadId: Some\\(\\d+\\)\\]",
             "acquiredThreadInfo" -> "\\[ThreadId: Some\\(\\d+\\)\\]",
             "timeWaitedMs" -> "\\d+",
@@ -1186,7 +1187,7 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
       }
       checkError(
         e,
-        errorClass = "CANNOT_LOAD_STATE_STORE.CANNOT_READ_CHECKPOINT",
+        condition = "CANNOT_LOAD_STATE_STORE.CANNOT_READ_CHECKPOINT",
         parameters = Map(
           "expectedVersion" -> "v2",
           "actualVersion" -> "v1"
@@ -1461,6 +1462,11 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
               db.load(0)
               db.put("a", "1")
               db.commit()
+              if (boundedMemoryUsage == "true") {
+                assert(db.metricsOpt.get.totalMemUsageBytes === 0)
+              } else {
+                assert(db.metricsOpt.get.totalMemUsageBytes > 0)
+              }
               db.getWriteBufferManagerAndCache()
             }
 
@@ -1471,6 +1477,11 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
               db.load(0)
               db.put("a", "1")
               db.commit()
+              if (boundedMemoryUsage == "true") {
+                assert(db.metricsOpt.get.totalMemUsageBytes === 0)
+              } else {
+                assert(db.metricsOpt.get.totalMemUsageBytes > 0)
+              }
               db.getWriteBufferManagerAndCache()
             }
 
@@ -1520,6 +1531,7 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
             db.remove("a")
             db.put("c", "3")
             db.commit()
+            assert(db.metricsOpt.get.totalMemUsageBytes === 0)
           }
         } finally {
           RocksDBMemoryManager.resetWriteBufferManagerAndCache
@@ -1688,6 +1700,206 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
     }
 
     withDB(remoteDir, version = 4, conf = conf) { db =>
+    }
+  }
+
+  testWithChangelogCheckpointingEnabled("time travel 4 -" +
+    " validate successful RocksDB load when metadata file is overwritten") {
+    val remoteDir = Utils.createTempDir().toString
+    val conf = dbConf.copy(minDeltasForSnapshot = 2, compactOnCommit = false)
+    new File(remoteDir).delete() // to make sure that the directory gets created
+    withDB(remoteDir, conf = conf) { db =>
+      for (version <- 0 to 1) {
+        db.load(version)
+        db.put(version.toString, version.toString)
+        db.commit()
+      }
+
+      // load previous version, and recreate the snapshot
+      db.load(1)
+      db.put("3", "3")
+
+      // upload any latest snapshots so far
+      db.doMaintenance()
+      db.commit()
+      // upload newly created snapshot 2.zip
+      db.doMaintenance()
+    }
+
+    // reload version 2 - should succeed
+    withDB(remoteDir, version = 2, conf = conf) { db =>
+    }
+  }
+
+  testWithChangelogCheckpointingEnabled("time travel 5 -" +
+    "validate successful RocksDB load when metadata file is not overwritten") {
+    val fmClass = "org.apache.spark.sql.execution.streaming.state." +
+      "NoOverwriteFileSystemBasedCheckpointFileManager"
+    withTempDir { dir =>
+      val conf = dbConf.copy(minDeltasForSnapshot = 0) // create snapshot every commit
+      val hadoopConf = new Configuration()
+      hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
+
+      val remoteDir = dir.getCanonicalPath
+      withDB(remoteDir, conf = conf, hadoopConf = hadoopConf) { db =>
+        db.load(0)
+        db.put("a", "1")
+        db.commit()
+
+        // load previous version, and recreate the snapshot
+        db.load(0)
+        db.put("a", "1")
+
+        // do not upload version 1 snapshot created previously
+        db.doMaintenance()
+        assert(snapshotVersionsPresent(remoteDir) == Seq.empty)
+
+        db.commit() // create snapshot again
+
+        // load version 1 - should succeed
+        withDB(remoteDir, version = 1, conf = conf, hadoopConf = hadoopConf) { db =>
+        }
+
+        // upload recently created snapshot
+        db.doMaintenance()
+        assert(snapshotVersionsPresent(remoteDir) == Seq(1))
+
+        // load version 1 again - should succeed
+        withDB(remoteDir, version = 1, conf = conf, hadoopConf = hadoopConf) { db =>
+        }
+      }
+    }
+  }
+
+  testWithChangelogCheckpointingEnabled("reloading the same version") {
+    // Keep executing the same batch for two or more times. Some queries with ForEachBatch
+    // will cause this behavior.
+    // The test was accidentally fixed by SPARK-48586 (https://github.com/apache/spark/pull/47130)
+    val remoteDir = Utils.createTempDir().toString
+    val conf = dbConf.copy(minDeltasForSnapshot = 2, compactOnCommit = false)
+    new File(remoteDir).delete() // to make sure that the directory gets created
+    withDB(remoteDir, conf = conf) { db =>
+      // load the same version of pending snapshot uploading
+      // This is possible because after committing version x, we can continue to x+1, and replay
+      // x+1. The replay will load a checkpoint by version x. At this moment, the snapshot
+      // uploading may not be finished.
+      // Previously this generated a problem: new files generated by reloading are added to
+      // local -> cloud file map and the information is used to skip some files uploading, which is
+      // wrong because these files aren't a part of the RocksDB checkpoint.
+      // This test was accidentally fixed by
+      // SPARK-48931 (https://github.com/apache/spark/pull/47393)
+
+      db.load(0)
+      db.put("foo", "bar")
+      // Snapshot checkpoint not needed
+      db.commit()
+
+      // Continue using local DB
+      db.load(1)
+      db.put("foo", "bar")
+      // Should create a local RocksDB snapshot
+      db.commit()
+      // Upload the local RocksDB snapshot to the cloud with 2.zip
+      db.doMaintenance()
+
+      // This will reload Db from the cloud.
+      db.load(1)
+      db.put("foo", "bar")
+      // Should create another local snapshot
+      db.commit()
+
+      // Continue using local DB
+      db.load(2)
+      db.put("foo", "bar")
+      // Snapshot checkpoint not needed
+      db.commit()
+
+      // Reload DB from the cloud, loading from 2.zip
+      db.load(2)
+      db.put("foo", "bar")
+      // Snapshot checkpoint not needed
+      db.commit()
+
+      // Will upload local snapshot and overwrite 2.zip
+      db.doMaintenance()
+
+      // Reload new 2.zip just uploaded to validate it is not corrupted.
+      db.load(2)
+      db.put("foo", "bar")
+      db.commit()
+
+      // Test the maintenance thread is delayed even after the next snapshot is created.
+      // There will be two outstanding snapshots.
+      for (batchVersion <- 3 to 6) {
+        db.load(batchVersion)
+        db.put("foo", "bar")
+        // In batchVersion 3 and 5, it will generate a local snapshot but won't be uploaded.
+        db.commit()
+      }
+      db.doMaintenance()
+
+      // Test the maintenance is called after each batch. This tests a common case where
+      // maintenance tasks finish quickly.
+      for (batchVersion <- 7 to 10) {
+        for (j <- 0 to 1) {
+          db.load(batchVersion)
+          db.put("foo", "bar")
+          db.commit()
+          db.doMaintenance()
+        }
+      }
+    }
+  }
+
+  for (randomSeed <- 1 to 8) {
+    for (ifTestSkipBatch <- 0 to 1) {
+      testWithChangelogCheckpointingEnabled(
+        s"randomized snapshotting $randomSeed ifTestSkipBatch $ifTestSkipBatch") {
+        // The unit test simulates the case where batches can be reloaded and maintenance tasks
+        // can be delayed. After each batch, we randomly decide whether we would move onto the
+        // next batch, and whetehr maintenance task is executed.
+        val remoteDir = Utils.createTempDir().toString
+        val conf = dbConf.copy(minDeltasForSnapshot = 3, compactOnCommit = false)
+        new File(remoteDir).delete() // to make sure that the directory gets created
+        withDB(remoteDir, conf = conf) { db =>
+          // A second DB is opened to simulate another executor that runs some batches that
+          // skipped in the current DB.
+          withDB(remoteDir, conf = conf) { db2 =>
+            val random = new Random(randomSeed)
+            var curVer: Int = 0
+            for (i <- 1 to 100) {
+              db.load(curVer)
+              db.put("foo", "bar")
+              db.commit()
+              // For a one in five chance, maintenance task is executed. The chance is created to
+              // simulate the case where snapshot isn't immediatelly uploaded, and even delayed
+              // so that the next snapshot is ready. We create a snapshot in every 3 batches, so
+              // with 1/5 chance, it is more likely to create longer maintenance delay.
+              if (random.nextInt(5) == 0) {
+                db.doMaintenance()
+              }
+              // For half the chance, we move to the next version, and half the chance we keep the
+              // same version. When the same version is kept, the DB will be reloaded.
+              if (random.nextInt(2) == 0) {
+                val inc = if (ifTestSkipBatch == 1) {
+                  random.nextInt(3)
+                } else {
+                  1
+                }
+                if (inc > 1) {
+                  // Create changelog files in the gap
+                  for (j <- 1 to inc - 1) {
+                    db2.load(curVer + j)
+                    db2.put("foo", "bar")
+                    db2.commit()
+                  }
+                }
+                curVer = curVer + inc
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -1863,6 +2075,88 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
     }
   }
 
+  test("ensure local files deleted on filesystem" +
+    " are cleaned from dfs file mapping") {
+    def getSSTFiles(dir: File): Set[File] = {
+      val sstFiles = new mutable.HashSet[File]()
+      dir.listFiles().foreach { f =>
+        if (f.isDirectory) {
+          sstFiles ++= getSSTFiles(f)
+        } else {
+          if (f.getName.endsWith(".sst")) {
+            sstFiles.add(f)
+          }
+        }
+      }
+      sstFiles.toSet
+    }
+
+    def filterAndDeleteSSTFiles(dir: File, filesToKeep: Set[File]): Unit = {
+      dir.listFiles().foreach { f =>
+        if (f.isDirectory) {
+          filterAndDeleteSSTFiles(f, filesToKeep)
+        } else {
+          if (!filesToKeep.contains(f) && f.getName.endsWith(".sst")) {
+            logInfo(s"deleting ${f.getAbsolutePath} from local directory")
+            f.delete()
+          }
+        }
+      }
+    }
+
+    withTempDir { dir =>
+      withTempDir { localDir =>
+        val sqlConf = new SQLConf()
+        val dbConf = RocksDBConf(StateStoreConf(sqlConf))
+        logInfo(s"config set to ${dbConf.compactOnCommit}")
+        val hadoopConf = new Configuration()
+        val remoteDir = dir.getCanonicalPath
+        withDB(remoteDir = remoteDir,
+          conf = dbConf,
+          hadoopConf = hadoopConf,
+          localDir = localDir) { db =>
+          db.load(0)
+          db.put("a", "1")
+          db.put("b", "1")
+          db.commit()
+          db.doMaintenance()
+
+          // find all SST files written in version 1
+          val sstFiles = getSSTFiles(localDir)
+
+          // make more commits, this would generate more SST files and write
+          // them to remoteDir
+          for (version <- 1 to 10) {
+            db.load(version)
+            db.put("c", "1")
+            db.put("d", "1")
+            db.commit()
+            db.doMaintenance()
+          }
+
+          // clean the SST files committed after version 1 from local
+          // filesystem. This is similar to what a process like compaction
+          // where multiple L0 SST files can be merged into a single L1 file
+          filterAndDeleteSSTFiles(localDir, sstFiles)
+
+          // reload 2, and overwrite commit for version 3, this should not
+          // reuse any locally deleted files as they should be removed from the mapping
+          db.load(2)
+          db.put("e", "1")
+          db.put("f", "1")
+          db.commit()
+          db.doMaintenance()
+
+          // clean local state
+          db.load(0)
+
+          // reload version 3, should be successful
+          db.load(3)
+        }
+      }
+    }
+  }
+
   private def sqlConf = SQLConf.get.clone()
 
   private def dbConf = RocksDBConf(StateStoreConf(sqlConf))
@@ -1872,12 +2166,16 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
       version: Int = 0,
       conf: RocksDBConf = dbConf,
       hadoopConf: Configuration = new Configuration(),
-      useColumnFamilies: Boolean = false)(
+      useColumnFamilies: Boolean = false,
+      localDir: File = Utils.createTempDir())(
       func: RocksDB => T): T = {
     var db: RocksDB = null
     try {
       db = new RocksDB(
-        remoteDir, conf = conf, hadoopConf = hadoopConf,
+        remoteDir,
+        conf = conf,
+        localRootDir = localDir,
+        hadoopConf = hadoopConf,
         loggingId = s"[Thread-${Thread.currentThread.getId}]",
         useColumnFamilies = useColumnFamilies
         )
@@ -1904,7 +2202,11 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
       numKeys: Int): Unit = {
     val checkpointDir = Utils.createTempDir().getAbsolutePath // local dir to create checkpoints
     generateFiles(checkpointDir, fileToLengths)
-    fileManager.saveCheckpointToDfs(checkpointDir, version, numKeys)
+    fileManager.saveCheckpointToDfs(
+      checkpointDir,
+      version,
+      numKeys,
+      fileManager.captureFileMapReference())
   }
 
   def loadAndVerifyCheckpointFiles(
@@ -1929,8 +2231,7 @@ class RocksDBSuite extends AlsoTestWithChangelogCheckpointingEnabled with Shared
 
   def toStr(kv: ByteArrayPair): (String, String) = (toStr(kv.key), toStr(kv.value))
 
-  def iterator(db: RocksDB, colFamilyName: String = "default"):
-    Iterator[(String, String)] = db.iterator(colFamilyName).map(toStr)
+  def iterator(db: RocksDB): Iterator[(String, String)] = db.iterator().map(toStr)
 
   def listFiles(file: File): Seq[File] = {
     if (!file.exists()) return Seq.empty

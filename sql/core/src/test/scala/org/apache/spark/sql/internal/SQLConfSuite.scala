@@ -17,12 +17,12 @@
 
 package org.apache.spark.sql.internal
 
-import java.util.TimeZone
+import java.util.{Locale, TimeZone}
 
 import org.apache.hadoop.fs.Path
 import org.apache.logging.log4j.Level
 
-import org.apache.spark.{SPARK_DOC_ROOT, SparkNoSuchElementException}
+import org.apache.spark.{SPARK_DOC_ROOT, SparkIllegalArgumentException, SparkNoSuchElementException}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.MIT
@@ -121,16 +121,12 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
 
   test(s"SPARK-35168: ${SQLConf.Deprecated.MAPRED_REDUCE_TASKS} should respect" +
       s" ${SQLConf.SHUFFLE_PARTITIONS.key}") {
-    spark.sessionState.conf.clear()
-    try {
-      sql(s"SET ${SQLConf.ADAPTIVE_EXECUTION_ENABLED.key}=true")
-      sql(s"SET ${SQLConf.COALESCE_PARTITIONS_ENABLED.key}=true")
-      sql(s"SET ${SQLConf.COALESCE_PARTITIONS_INITIAL_PARTITION_NUM.key}=1")
-      sql(s"SET ${SQLConf.SHUFFLE_PARTITIONS.key}=2")
+    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+      SQLConf.COALESCE_PARTITIONS_ENABLED.key -> "true",
+      SQLConf.COALESCE_PARTITIONS_INITIAL_PARTITION_NUM.key -> "1",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "2") {
       checkAnswer(sql(s"SET ${SQLConf.Deprecated.MAPRED_REDUCE_TASKS}"),
         Row(SQLConf.SHUFFLE_PARTITIONS.key, "2"))
-    } finally {
-      spark.sessionState.conf.clear()
     }
   }
 
@@ -208,7 +204,7 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     // spark core conf w/ entry registered
     checkError(
       exception = intercept[AnalysisException](sql("RESET spark.executor.cores")),
-      errorClass = "CANNOT_MODIFY_CONFIG",
+      condition = "CANNOT_MODIFY_CONFIG",
       parameters = Map("key" -> "\"spark.executor.cores\"", "docroot" -> SPARK_DOC_ROOT)
     )
 
@@ -237,15 +233,15 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     // static sql configs
     checkError(
       exception = intercept[AnalysisException](sql(s"RESET ${StaticSQLConf.WAREHOUSE_PATH.key}")),
-      errorClass = "_LEGACY_ERROR_TEMP_1325",
+      condition = "_LEGACY_ERROR_TEMP_1325",
       parameters = Map("key" -> "spark.sql.warehouse.dir"))
 
   }
 
   test("invalid conf value") {
-    spark.sessionState.conf.clear()
     val e = intercept[IllegalArgumentException] {
-      sql(s"set ${SQLConf.CASE_SENSITIVE.key}=10")
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "10") {
+      }
     }
     assert(e.getMessage === s"${SQLConf.CASE_SENSITIVE.key} should be boolean, but was 10")
   }
@@ -445,15 +441,19 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     spark.conf.set(SQLConf.SESSION_LOCAL_TIMEZONE.key, "GMT+8:00")
     assert(sql(s"set ${SQLConf.SESSION_LOCAL_TIMEZONE.key}").head().getString(1) === "GMT+8:00")
 
-    intercept[IllegalArgumentException] {
+    intercept[SparkIllegalArgumentException] {
       spark.conf.set(SQLConf.SESSION_LOCAL_TIMEZONE.key, "pst")
     }
-    val e = intercept[IllegalArgumentException] {
-      spark.conf.set(SQLConf.SESSION_LOCAL_TIMEZONE.key, "Asia/shanghai")
-    }
-    assert(e.getMessage ===
-      s"'Asia/shanghai' in ${SQLConf.SESSION_LOCAL_TIMEZONE.key} is invalid." +
-        " Cannot resolve the given timezone with ZoneId.of(_, ZoneId.SHORT_IDS)")
+
+    val invalidTz = "Asia/shanghai"
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        spark.conf.set(SQLConf.SESSION_LOCAL_TIMEZONE.key, invalidTz)
+      },
+      condition = "INVALID_CONF_VALUE.TIME_ZONE",
+      parameters = Map(
+        "confValue" -> invalidTz,
+        "confName" -> SQLConf.SESSION_LOCAL_TIMEZONE.key))
   }
 
   test("set time zone") {
@@ -464,9 +464,15 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     sql("set time zone local")
     assert(spark.conf.get(SQLConf.SESSION_LOCAL_TIMEZONE) === TimeZone.getDefault.getID)
 
-    val e1 = intercept[IllegalArgumentException](sql("set time zone 'invalid'"))
-    assert(e1.getMessage === s"'invalid' in ${SQLConf.SESSION_LOCAL_TIMEZONE.key} is invalid." +
-      " Cannot resolve the given timezone with ZoneId.of(_, ZoneId.SHORT_IDS)")
+    val tz = "Invalid TZ"
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        sql(s"SET TIME ZONE '$tz'").collect()
+      },
+      condition = "INVALID_CONF_VALUE.TIME_ZONE",
+      parameters = Map(
+        "confValue" -> tz,
+        "confName" -> SQLConf.SESSION_LOCAL_TIMEZONE.key))
 
     (-18 to 18).map(v => (v, s"interval '$v' hours")).foreach { case (i, interval) =>
       sql(s"set time zone $interval")
@@ -480,7 +486,7 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
     val sqlText = "set time zone interval 19 hours"
     checkError(
       exception = intercept[ParseException](sql(sqlText)),
-      errorClass = "_LEGACY_ERROR_TEMP_0044",
+      condition = "_LEGACY_ERROR_TEMP_0044",
       parameters = Map.empty,
       context = ExpectedContext(sqlText, 0, 30))
   }
@@ -495,10 +501,28 @@ class SQLConfSuite extends QueryTest with SharedSparkSession {
          |""".stripMargin)
   }
 
+  test("SPARK-47765: set collation") {
+    Seq("UNICODE", "UNICODE_CI", "utf8_lcase", "utf8_binary").foreach { collation =>
+      sql(s"set collation $collation")
+      assert(spark.conf.get(SQLConf.DEFAULT_COLLATION) === collation.toUpperCase(Locale.ROOT))
+    }
+
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        sql(s"SET COLLATION unicode_c").collect()
+      },
+      condition = "INVALID_CONF_VALUE.DEFAULT_COLLATION",
+      parameters = Map(
+        "confValue" -> "UNICODE_C",
+        "confName" -> "spark.sql.session.collation.default",
+        "proposals" -> "UNICODE"
+      ))
+  }
+
   test("SPARK-43028: config not found error") {
     checkError(
       exception = intercept[SparkNoSuchElementException](spark.conf.get("some.conf")),
-      errorClass = "SQL_CONF_NOT_FOUND",
+      condition = "SQL_CONF_NOT_FOUND",
       parameters = Map("sqlConf" -> "\"some.conf\""))
   }
 }

@@ -28,13 +28,9 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
 
-class PythonDataSourceSuite extends QueryTest with SharedSparkSession {
-  import IntegratedUDFTestUtils._
+abstract class PythonDataSourceSuiteBase extends QueryTest with SharedSparkSession {
 
-  setupTestData()
-
-  private def dataSourceName = "SimpleDataSource"
-  private val simpleDataSourceReaderScript: String =
+  protected val simpleDataSourceReaderScript: String =
     """
       |from pyspark.sql.datasource import DataSourceReader, InputPartition
       |class SimpleDataSourceReader(DataSourceReader):
@@ -45,8 +41,8 @@ class PythonDataSourceSuite extends QueryTest with SharedSparkSession {
       |        yield (1, partition.value)
       |        yield (2, partition.value)
       |""".stripMargin
-  private val staticSourceName = "custom_source"
-  private var tempDir: File = _
+  protected val staticSourceName = "custom_source"
+  protected var tempDir: File = _
 
   override def beforeAll(): Unit = {
     // Create a Python Data Source package before starting up the Spark Session
@@ -89,6 +85,14 @@ class PythonDataSourceSuite extends QueryTest with SharedSparkSession {
       super.afterAll()
     }
   }
+
+  setupTestData()
+
+  protected def dataSourceName = "SimpleDataSource"
+}
+
+class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
+  import IntegratedUDFTestUtils._
 
   test("SPARK-45917: automatic registration of Python Data Source") {
     assume(shouldTestPandasUDFs)
@@ -184,7 +188,7 @@ class PythonDataSourceSuite extends QueryTest with SharedSparkSession {
     spark.dataSource.registerPython(dataSourceName, dataSource)
     checkError(
       exception = intercept[AnalysisException](spark.read.format(dataSourceName).load()),
-      errorClass = "INVALID_SCHEMA.NON_STRUCT_TYPE",
+      condition = "INVALID_SCHEMA.NON_STRUCT_TYPE",
       parameters = Map("inputSchema" -> "INT", "dataType" -> "\"INT\""))
   }
 
@@ -305,7 +309,7 @@ class PythonDataSourceSuite extends QueryTest with SharedSparkSession {
           exception = intercept[AnalysisException] {
             spark.dataSource.registerPython(provider, dataSource)
           },
-          errorClass = "DATA_SOURCE_ALREADY_EXISTS",
+          condition = "DATA_SOURCE_ALREADY_EXISTS",
           parameters = Map("provider" -> provider))
       }
     }
@@ -653,7 +657,7 @@ class PythonDataSourceSuite extends QueryTest with SharedSparkSession {
         exception = intercept[AnalysisException] {
           spark.range(1).write.format(dataSourceName).save()
         },
-        errorClass = "UNSUPPORTED_DATA_SOURCE_SAVE_MODE",
+        condition = "UNSUPPORTED_DATA_SOURCE_SAVE_MODE",
         parameters = Map("source" -> "SimpleDataSource", "createMode" -> "\"ErrorIfExists\""))
     }
 
@@ -662,7 +666,7 @@ class PythonDataSourceSuite extends QueryTest with SharedSparkSession {
         exception = intercept[AnalysisException] {
           spark.range(1).write.format(dataSourceName).mode("ignore").save()
         },
-        errorClass = "UNSUPPORTED_DATA_SOURCE_SAVE_MODE",
+        condition = "UNSUPPORTED_DATA_SOURCE_SAVE_MODE",
         parameters = Map("source" -> "SimpleDataSource", "createMode" -> "\"Ignore\""))
     }
 
@@ -671,7 +675,7 @@ class PythonDataSourceSuite extends QueryTest with SharedSparkSession {
         exception = intercept[AnalysisException] {
           spark.range(1).write.format(dataSourceName).mode("foo").save()
         },
-        errorClass = "INVALID_SAVE_MODE",
+        condition = "INVALID_SAVE_MODE",
         parameters = Map("mode" -> "\"foo\""))
     }
   }

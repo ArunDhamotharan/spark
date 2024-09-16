@@ -27,13 +27,17 @@ import org.apache.spark.sql.catalyst.parser.SqlBaseParser._
 import org.apache.spark.sql.catalyst.trees.Origin
 
 /**
- * Object for grouping all error messages of the query parsing.
- * Currently it includes all ParseException.
+ * Object for grouping all error messages of the query parsing. Currently it includes all
+ * ParseException.
  */
 private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
 
   def invalidInsertIntoError(ctx: InsertIntoContext): Throwable = {
     new ParseException(errorClass = "_LEGACY_ERROR_TEMP_0001", ctx)
+  }
+
+  def parserStackOverflow(parserRuleContext: ParserRuleContext): Throwable = {
+    throw new ParseException(errorClass = "FAILED_TO_PARSE_TOO_COMPLEX", ctx = parserRuleContext)
   }
 
   def insertOverwriteDirectoryUnsupportedError(): Throwable = {
@@ -42,7 +46,7 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
 
   def columnAliasInOperationNotAllowedError(op: String, ctx: TableAliasContext): Throwable = {
     new ParseException(
-      errorClass = "COLUMN_ALIASES_IS_NOT_ALLOWED",
+      errorClass = "COLUMN_ALIASES_NOT_ALLOWED",
       messageParameters = Map("op" -> toSQLStmt(op)),
       ctx.identifierList())
   }
@@ -154,7 +158,9 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def incompatibleJoinTypesError(
-      joinType1: String, joinType2: String, ctx: ParserRuleContext): Throwable = {
+      joinType1: String,
+      joinType2: String,
+      ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "INCOMPATIBLE_JOIN_TYPES",
       messageParameters = Map(
@@ -203,13 +209,12 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def cannotParseValueTypeError(
-      valueType: String, value: String, ctx: TypeConstructorContext): Throwable = {
+      valueType: String,
+      value: String,
+      ctx: TypeConstructorContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_TYPED_LITERAL",
-      messageParameters = Map(
-        "valueType" -> toSQLType(valueType),
-        "value" -> toSQLValue(value)
-      ),
+      messageParameters = Map("valueType" -> toSQLType(valueType), "value" -> toSQLValue(value)),
       ctx)
   }
 
@@ -225,8 +230,12 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
       ctx)
   }
 
-  def invalidNumericLiteralRangeError(rawStrippedQualifier: String, minValue: BigDecimal,
-      maxValue: BigDecimal, typeName: String, ctx: NumberContext): Throwable = {
+  def invalidNumericLiteralRangeError(
+      rawStrippedQualifier: String,
+      minValue: BigDecimal,
+      maxValue: BigDecimal,
+      typeName: String,
+      ctx: NumberContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_NUMERIC_LITERAL_RANGE",
       messageParameters = Map(
@@ -253,7 +262,9 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def fromToIntervalUnsupportedError(
-      from: String, to: String, ctx: ParserRuleContext): Throwable = {
+      from: String,
+      to: String,
+      ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "_LEGACY_ERROR_TEMP_0028",
       messageParameters = Map("from" -> from, "to" -> to),
@@ -282,8 +293,9 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def nestedTypeMissingElementTypeError(
-      dataType: String, ctx: PrimitiveDataTypeContext): Throwable = {
-    dataType match {
+      dataType: String,
+      ctx: PrimitiveDataTypeContext): Throwable = {
+    dataType.toUpperCase(Locale.ROOT) match {
       case "ARRAY" =>
         new ParseException(
           errorClass = "INCOMPLETE_TYPE_DEFINITION.ARRAY",
@@ -303,23 +315,25 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def partitionTransformNotExpectedError(
-      name: String, expr: String, ctx: ApplyTransformContext): Throwable = {
+      name: String,
+      expr: String,
+      ctx: ApplyTransformContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_SQL_SYNTAX.INVALID_COLUMN_REFERENCE",
-      messageParameters = Map(
-        "transform" -> toSQLId(name),
-        "expr" -> expr),
+      messageParameters = Map("transform" -> toSQLId(name), "expr" -> expr),
       ctx)
   }
 
   def wrongNumberArgumentsForTransformError(
-      name: String, actualNum: Int, ctx: ApplyTransformContext): Throwable = {
+      name: String,
+      actualNum: Int,
+      ctx: ApplyTransformContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_SQL_SYNTAX.TRANSFORM_WRONG_NUM_ARGS",
       messageParameters = Map(
         "transform" -> toSQLId(name),
-      "expectedNum" -> "1",
-      "actualNum" -> actualNum.toString),
+        "expectedNum" -> "1",
+        "actualNum" -> actualNum.toString),
       ctx)
   }
 
@@ -331,7 +345,9 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def cannotCleanReservedNamespacePropertyError(
-      property: String, ctx: ParserRuleContext, msg: String): Throwable = {
+      property: String,
+      ctx: ParserRuleContext,
+      msg: String): Throwable = {
     new ParseException(
       errorClass = "UNSUPPORTED_FEATURE.SET_NAMESPACE_PROPERTY",
       messageParameters = Map("property" -> property, "msg" -> msg),
@@ -342,12 +358,13 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
     new ParseException(
       errorClass = "UNSUPPORTED_FEATURE.SET_PROPERTIES_AND_DBPROPERTIES",
       messageParameters = Map.empty,
-      ctx
-    )
+      ctx)
   }
 
   def cannotCleanReservedTablePropertyError(
-      property: String, ctx: ParserRuleContext, msg: String): Throwable = {
+      property: String,
+      ctx: ParserRuleContext,
+      msg: String): Throwable = {
     new ParseException(
       errorClass = "UNSUPPORTED_FEATURE.SET_TABLE_PROPERTY",
       messageParameters = Map("property" -> property, "msg" -> msg),
@@ -355,12 +372,12 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def duplicatedTablePathsFoundError(
-      pathOne: String, pathTwo: String, ctx: ParserRuleContext): Throwable = {
+      pathOne: String,
+      pathTwo: String,
+      ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "_LEGACY_ERROR_TEMP_0032",
-      messageParameters = Map(
-        "pathOne" -> pathOne,
-        "pathTwo" -> pathTwo),
+      messageParameters = Map("pathOne" -> pathOne, "pathTwo" -> pathTwo),
       ctx)
   }
 
@@ -368,15 +385,17 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
     new ParseException(errorClass = "_LEGACY_ERROR_TEMP_0033", ctx)
   }
 
-  def operationInHiveStyleCommandUnsupportedError(operation: String,
-      command: String, ctx: StatementContext, msgOpt: Option[String] = None): Throwable = {
+  def operationInHiveStyleCommandUnsupportedError(
+      operation: String,
+      command: String,
+      ctx: StatementContext,
+      msgOpt: Option[String] = None): Throwable = {
     new ParseException(
       errorClass = "_LEGACY_ERROR_TEMP_0034",
       messageParameters = Map(
         "operation" -> operation,
         "command" -> command,
-        "msg" -> msgOpt.map(m => s", $m").getOrElse("")
-      ),
+        "msg" -> msgOpt.map(m => s", $m").getOrElse("")),
       ctx)
   }
 
@@ -384,6 +403,13 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
     new ParseException(
       errorClass = "_LEGACY_ERROR_TEMP_0035",
       messageParameters = Map("message" -> message),
+      ctx)
+  }
+
+  def invalidStatementError(operation: String, ctx: ParserRuleContext): Throwable = {
+    new ParseException(
+      errorClass = "INVALID_STATEMENT_OR_CLAUSE",
+      messageParameters = Map("operation" -> toSQLStmt(operation)),
       ctx)
   }
 
@@ -402,7 +428,8 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def addCatalogInCacheTableAsSelectNotAllowedError(
-      quoted: String, ctx: CacheTableContext): Throwable = {
+      quoted: String,
+      ctx: CacheTableContext): Throwable = {
     new ParseException(
       errorClass = "_LEGACY_ERROR_TEMP_0037",
       messageParameters = Map("quoted" -> quoted),
@@ -439,7 +466,7 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
       messageParameters = Map.empty)
   }
 
-  def invalidIdentifierError(ident: String, ctx: ErrorIdentContext): Throwable = {
+  def invalidIdentifierError(ident: String, ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_IDENTIFIER",
       messageParameters = Map("ident" -> ident),
@@ -466,22 +493,22 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   }
 
   def invalidPropertyKeyForSetQuotedConfigurationError(
-      keyCandidate: String, valueStr: String, ctx: ParserRuleContext): Throwable = {
+      keyCandidate: String,
+      valueStr: String,
+      ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_PROPERTY_KEY",
-      messageParameters = Map(
-        "key" -> toSQLConf(keyCandidate),
-        "value" -> toSQLConf(valueStr)),
+      messageParameters = Map("key" -> toSQLConf(keyCandidate), "value" -> toSQLConf(valueStr)),
       ctx)
   }
 
   def invalidPropertyValueForSetQuotedConfigurationError(
-      valueCandidate: String, keyStr: String, ctx: ParserRuleContext): Throwable = {
+      valueCandidate: String,
+      keyStr: String,
+      ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_PROPERTY_VALUE",
-      messageParameters = Map(
-        "value" -> toSQLConf(valueCandidate),
-        "key" -> toSQLConf(keyStr)),
+      messageParameters = Map("value" -> toSQLConf(valueCandidate), "key" -> toSQLConf(keyStr)),
       ctx)
   }
 
@@ -529,8 +556,34 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
       ctx)
   }
 
+  def identityColumnUnsupportedDataType(
+      ctx: IdentityColumnContext,
+      dataType: String): Throwable = {
+    new ParseException("IDENTITY_COLUMNS_UNSUPPORTED_DATA_TYPE", Map("dataType" -> dataType), ctx)
+  }
+
+  def identityColumnIllegalStep(ctx: IdentityColSpecContext): Throwable = {
+    new ParseException("IDENTITY_COLUMNS_ILLEGAL_STEP", Map.empty, ctx)
+  }
+
+  def identityColumnDuplicatedSequenceGeneratorOption(
+      ctx: IdentityColSpecContext,
+      sequenceGeneratorOption: String): Throwable = {
+    new ParseException(
+      "IDENTITY_COLUMNS_DUPLICATED_SEQUENCE_GENERATOR_OPTION",
+      Map("sequenceGeneratorOption" -> sequenceGeneratorOption),
+      ctx)
+  }
+
   def createViewWithBothIfNotExistsAndReplaceError(ctx: CreateViewContext): Throwable = {
     new ParseException(errorClass = "_LEGACY_ERROR_TEMP_0052", ctx)
+  }
+
+  def temporaryViewWithSchemaBindingMode(ctx: StatementContext): Throwable = {
+    new ParseException(
+      errorClass = "UNSUPPORTED_FEATURE.TEMPORARY_VIEW_WITH_SCHEMA_BINDING_MODE",
+      messageParameters = Map.empty,
+      ctx)
   }
 
   def parameterMarkerNotAllowed(statement: String, origin: Origin): Throwable = {
@@ -555,19 +608,17 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
       ctx)
   }
 
-  def createFuncWithBothIfNotExistsAndReplaceError(ctx: CreateFunctionContext): Throwable = {
+  def createFuncWithBothIfNotExistsAndReplaceError(ctx: ParserRuleContext): Throwable = {
     new ParseException(
-      errorClass = "INVALID_SQL_SYNTAX.CREATE_FUNC_WITH_IF_NOT_EXISTS_AND_REPLACE",
+      errorClass = "INVALID_SQL_SYNTAX.CREATE_ROUTINE_WITH_IF_NOT_EXISTS_AND_REPLACE",
       ctx)
   }
 
-  def defineTempFuncWithIfNotExistsError(ctx: CreateFunctionContext): Throwable = {
-    new ParseException(
-      errorClass = "INVALID_SQL_SYNTAX.CREATE_TEMP_FUNC_WITH_IF_NOT_EXISTS",
-      ctx)
+  def defineTempFuncWithIfNotExistsError(ctx: ParserRuleContext): Throwable = {
+    new ParseException(errorClass = "INVALID_SQL_SYNTAX.CREATE_TEMP_FUNC_WITH_IF_NOT_EXISTS", ctx)
   }
 
-  def unsupportedFunctionNameError(funcName: Seq[String], ctx: CreateFunctionContext): Throwable = {
+  def unsupportedFunctionNameError(funcName: Seq[String], ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_SQL_SYNTAX.MULTI_PART_NAME",
       messageParameters = Map(
@@ -578,7 +629,7 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
 
   def specifyingDBInCreateTempFuncError(
       databaseName: String,
-      ctx: CreateFunctionContext): Throwable = {
+      ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_SQL_SYNTAX.CREATE_TEMP_FUNC_WITH_DATABASE",
       messageParameters = Map("database" -> toSQLId(databaseName)),
@@ -613,9 +664,8 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
   def invalidNameForDropTempFunc(name: Seq[String], ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "INVALID_SQL_SYNTAX.MULTI_PART_NAME",
-      messageParameters = Map(
-        "statement" -> toSQLStmt("DROP TEMPORARY FUNCTION"),
-        "funcName" -> toSQLId(name)),
+      messageParameters =
+        Map("statement" -> toSQLStmt("DROP TEMPORARY FUNCTION"), "funcName" -> toSQLId(name)),
       ctx)
   }
 
@@ -631,9 +681,7 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
     new ParseException(errorClass = "REF_DEFAULT_VALUE_IS_NOT_ALLOWED_IN_PARTITION", ctx)
   }
 
-  def duplicateArgumentNamesError(
-      arguments: Seq[String],
-      ctx: ParserRuleContext): Throwable = {
+  def duplicateArgumentNamesError(arguments: Seq[String], ctx: ParserRuleContext): Throwable = {
     new ParseException(
       errorClass = "EXEC_IMMEDIATE_DUPLICATE_ARGUMENT_ALIASES",
       messageParameters = Map("aliases" -> arguments.map(toSQLId).mkString(", ")),
@@ -660,12 +708,9 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
       }
     new ParseException(
       errorClass = errorClass,
-      messageParameters = alterTypeMap ++ Map(
-          "columnName" -> columnName,
-          "optionName" -> optionName
-        ),
-      ctx
-    )
+      messageParameters =
+        alterTypeMap ++ Map("columnName" -> columnName, "optionName" -> optionName),
+      ctx)
   }
 
   def invalidDatetimeUnitError(
@@ -678,19 +723,17 @@ private[sql] object QueryParsingErrors extends DataTypeErrorsBase {
         "functionName" -> toSQLId(functionName),
         "parameter" -> toSQLId("unit"),
         "invalidValue" -> invalidValue),
-      ctx
-    )
+      ctx)
   }
 
   def invalidTableFunctionIdentifierArgumentMissingParentheses(
-      ctx: ParserRuleContext, argumentName: String): Throwable = {
+      ctx: ParserRuleContext,
+      argumentName: String): Throwable = {
     new ParseException(
       errorClass =
         "INVALID_SQL_SYNTAX.INVALID_TABLE_FUNCTION_IDENTIFIER_ARGUMENT_MISSING_PARENTHESES",
-      messageParameters = Map(
-        "argumentName" -> toSQLId(argumentName)),
-      ctx
-    )
+      messageParameters = Map("argumentName" -> toSQLId(argumentName)),
+      ctx)
   }
 
   def clusterByWithPartitionedBy(ctx: ParserRuleContext): Throwable = {

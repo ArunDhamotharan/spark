@@ -157,7 +157,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
         sql("CACHE TABLE tempView AS SELECT 1")
       }
       checkError(e,
-        errorClass = "TEMP_TABLE_OR_VIEW_ALREADY_EXISTS",
+        condition = "TEMP_TABLE_OR_VIEW_ALREADY_EXISTS",
         parameters = Map("relationName" -> "`tempView`"))
     }
   }
@@ -1107,7 +1107,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
     assert(queryStats1.map(_._1.name).isEmpty)
 
     val cacheManager = spark.sharedState.cacheManager
-    val cachedData = cacheManager.lookupCachedData(query().logicalPlan)
+    val cachedData = cacheManager.lookupCachedData(query())
     assert(cachedData.isDefined)
     val queryAttrs = cachedData.get.plan.output
     assert(queryAttrs.size === 3)
@@ -1436,7 +1436,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
       withSQLConf(SQLConf.STORE_ANALYZED_PLAN_FOR_VIEW.key -> storeAnalyzed.toString) {
         withGlobalTempView("view1") {
           withTempView("view2") {
-            val db = spark.sharedState.globalTempViewManager.database
+            val db = spark.sharedState.globalTempDB
             sql("CREATE GLOBAL TEMPORARY VIEW view1 AS SELECT * FROM testData WHERE key > 1")
             sql(s"CACHE TABLE view2 AS SELECT * FROM ${db}.view1 WHERE value > 1")
             assert(spark.catalog.isCached("view2"))
@@ -1473,7 +1473,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
           assert(spark.catalog.isCached("view2"))
 
           val oldView = spark.table("view2")
-          spark.sqlContext.uncacheTable("view1")
+          spark.catalog.uncacheTable("view1")
           assert(storeAnalyzed ==
             spark.sharedState.cacheManager.lookupCachedData(oldView).isDefined,
             s"when storeAnalyzed = $storeAnalyzed")
@@ -1487,13 +1487,13 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
       withSQLConf(SQLConf.STORE_ANALYZED_PLAN_FOR_VIEW.key -> storeAnalyzed.toString) {
         withGlobalTempView("view1") {
           withTempView("view2") {
-            val db = spark.sharedState.globalTempViewManager.database
+            val db = spark.sharedState.globalTempDB
             sql("CREATE GLOBAL TEMPORARY VIEW view1 AS SELECT * FROM testData WHERE key > 1")
             sql(s"CACHE TABLE view2 AS SELECT * FROM $db.view1 WHERE value > 1")
             assert(spark.catalog.isCached("view2"))
 
             val oldView = spark.table("view2")
-            spark.sqlContext.uncacheTable(s"$db.view1")
+            spark.catalog.uncacheTable(s"$db.view1")
             assert(storeAnalyzed ==
               spark.sharedState.cacheManager.lookupCachedData(oldView).isDefined,
               s"when storeAnalyzed = $storeAnalyzed")
@@ -1517,7 +1517,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
     Seq(true, false).foreach { storeAnalyzed =>
       withSQLConf(SQLConf.STORE_ANALYZED_PLAN_FOR_VIEW.key -> storeAnalyzed.toString) {
         withGlobalTempView("global_tv") {
-          val db = spark.sharedState.globalTempViewManager.database
+          val db = spark.sharedState.globalTempDB
           testAlterTemporaryViewAsWithCache(TableIdentifier("global_tv", Some(db)), storeAnalyzed)
         }
       }
@@ -1575,7 +1575,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
 
   test("SPARK-34699: CREATE GLOBAL TEMP VIEW USING should uncache correctly") {
     withGlobalTempView("global_tv") {
-      val db = spark.sharedState.globalTempViewManager.database
+      val db = spark.sharedState.globalTempDB
       testCreateTemporaryViewUsingWithCache(TableIdentifier("global_tv", Some(db)))
     }
   }
@@ -1769,5 +1769,24 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
     intercept[IllegalArgumentException] {
       withSQLConf(SQLConf.DEFAULT_CACHE_STORAGE_LEVEL.key -> "DISK") {}
     }
+  }
+
+  test("SPARK-47633: Cache hit for lateral join with join condition") {
+    withTempView("t", "q1") {
+      sql("create or replace temp view t(c1, c2) as values (0, 1), (1, 2)")
+      val query = """select *
+                    |from t
+                    |join lateral (
+                    |  select c1 as a, c2 as b
+                    |  from t)
+                    |on c1 = a;
+                    |""".stripMargin
+      sql(s"cache table q1 as $query")
+      val df = sql(query)
+      checkAnswer(df,
+        Row(0, 1, 0, 1) :: Row(1, 2, 1, 2) :: Nil)
+      assert(getNumInMemoryRelations(df) == 1)
+    }
+
   }
 }

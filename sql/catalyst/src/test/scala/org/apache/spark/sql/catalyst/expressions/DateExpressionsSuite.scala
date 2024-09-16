@@ -28,7 +28,7 @@ import scala.language.postfixOps
 import scala.reflect.ClassTag
 import scala.util.Random
 
-import org.apache.spark.{SparkArithmeticException, SparkDateTimeException, SparkException, SparkFunSuite, SparkUpgradeException}
+import org.apache.spark.{SparkArithmeticException, SparkDateTimeException, SparkException, SparkFunSuite, SparkIllegalArgumentException, SparkUpgradeException}
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.catalyst.util.{DateTimeUtils, IntervalUtils, TimestampFormatter}
@@ -434,9 +434,12 @@ class DateExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     }
 
     withSQLConf((SQLConf.ANSI_ENABLED.key, "true")) {
-      checkExceptionInExpression[IllegalArgumentException](
+      checkErrorInExpression[SparkIllegalArgumentException](
         DateAddInterval(Literal(d), Literal(new CalendarInterval(1, 1, 25 * MICROS_PER_HOUR))),
-        "Cannot add hours, minutes or seconds, milliseconds, microseconds to a date")
+        "_LEGACY_ERROR_TEMP_2000",
+        Map("message" ->
+          "Cannot add hours, minutes or seconds, milliseconds, microseconds to a date",
+          "ansiConfig" -> "\"spark.sql.ansi.enabled\""))
     }
 
     withSQLConf((SQLConf.ANSI_ENABLED.key, "false")) {
@@ -1499,7 +1502,7 @@ class DateExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     }
 
     Seq('q', 'Q', 'e', 'c', 'A', 'n', 'N', 'p').foreach { l =>
-      checkException[IllegalArgumentException](l.toString)
+      checkException[SparkIllegalArgumentException](l.toString)
     }
   }
 
@@ -2030,12 +2033,12 @@ class DateExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       checkErrorInExpression[SparkArithmeticException](TimestampAdd("DAY",
         Literal(106751992),
         Literal(0L, TimestampType)),
-        errorClass = "DATETIME_OVERFLOW",
+        condition = "DATETIME_OVERFLOW",
         parameters = Map("operation" -> "add 106751992 DAY to TIMESTAMP '1970-01-01 00:00:00'"))
       checkErrorInExpression[SparkArithmeticException](TimestampAdd("QUARTER",
         Literal(1431655764),
         Literal(0L, TimestampType)),
-        errorClass = "DATETIME_OVERFLOW",
+        condition = "DATETIME_OVERFLOW",
         parameters = Map("operation" ->
           "add 1431655764 QUARTER to TIMESTAMP '1970-01-01 00:00:00'"))
     }
@@ -2100,11 +2103,11 @@ class DateExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
 
   test("datetime function CurrentDate and localtimestamp are Unevaluable") {
     checkError(exception = intercept[SparkException] { CurrentDate(UTC_OPT).eval(EmptyRow) },
-      errorClass = "INTERNAL_ERROR",
+      condition = "INTERNAL_ERROR",
       parameters = Map("message" -> "Cannot evaluate expression: current_date(Some(UTC))"))
 
     checkError(exception = intercept[SparkException] { LocalTimestamp(UTC_OPT).eval(EmptyRow) },
-      errorClass = "INTERNAL_ERROR",
+      condition = "INTERNAL_ERROR",
       parameters = Map("message" -> "Cannot evaluate expression: localtimestamp(Some(UTC))"))
   }
 }

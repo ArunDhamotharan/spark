@@ -27,7 +27,7 @@ license: |
 ## Apache Maven
 
 The Maven-based build is the build of reference for Apache Spark.
-Building Spark using Maven requires Maven 3.9.6 and Java 17/21.
+Building Spark using Maven requires Maven 3.9.9 and Java 17/21.
 Spark requires Scala 2.13; support for Scala 2.12 was removed in Spark 4.0.0.
 
 ### Setting up Maven's Memory Usage
@@ -79,15 +79,15 @@ from `hadoop.version`.
 
 Example:
 
-    ./build/mvn -Pyarn -Dhadoop.version=3.3.0 -DskipTests clean package
+    ./build/mvn -Pyarn -Dhadoop.version=3.4.0 -DskipTests clean package
 
 ## Building With Hive and JDBC Support
 
 To enable Hive integration for Spark SQL along with its JDBC server and CLI,
 add the `-Phive` and `-Phive-thriftserver` profiles to your existing build options.
-By default Spark will build with Hive 2.3.9.
+By default Spark will build with Hive 2.3.10.
 
-    # With Hive 2.3.9 support
+    # With Hive 2.3.10 support
     ./build/mvn -Pyarn -Phive -Phive-thriftserver -DskipTests clean package
 
 ## Packaging without Hadoop Dependencies for YARN
@@ -113,9 +113,12 @@ For instance, you can build the Spark Streaming module using:
 
 where `spark-streaming_{{site.SCALA_BINARY_VERSION}}` is the `artifactId` as defined in `streaming/pom.xml` file.
 
-## Building with Spark Connect support
+## Building with JVM Profile support
 
-    ./build/mvn -Pconnect -DskipTests clean package
+    ./build/mvn -Pjvm-profiler -DskipTests clean package
+
+**Note:** The `jvm-profiler` profile builds the assembly without including the dependency `ap-loader`,
+you can download it manually from maven central repo and use it together with `spark-profiler_{{site.SCALA_BINARY_VERSION}}`.
 
 ## Continuous Compilation
 
@@ -216,7 +219,7 @@ For information about how to run individual tests, refer to the
 
 If you are building Spark for use in a Python environment and you wish to pip install it, you will first need to build the Spark JARs as described above. Then you can construct an sdist package suitable for setup.py and pip installable package.
 
-    cd python; python setup.py sdist
+    cd python; python packaging/classic/setup.py sdist
 
 **Note:** Due to packaging requirements you can not directly pip install from the Python directory, rather you must first build the sdist package as described above.
 
@@ -239,7 +242,7 @@ The run-tests script also can be limited to a specific Python version or a speci
 
     ./python/run-tests --python-executables=python --modules=pyspark-sql
 
-## Running R Tests
+## Running R Tests (deprecated)
 
 To run the SparkR tests you will need to install the [knitr](https://cran.r-project.org/package=knitr), [rmarkdown](https://cran.r-project.org/package=rmarkdown), [testthat](https://cran.r-project.org/package=testthat), [e1071](https://cran.r-project.org/package=e1071) and [survival](https://cran.r-project.org/package=survival) packages first:
 

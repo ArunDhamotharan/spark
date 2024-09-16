@@ -533,7 +533,7 @@ class SubquerySuite extends QueryTest
       }
       checkError(
         exception,
-        errorClass = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
+        condition = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
           "NON_CORRELATED_COLUMNS_IN_GROUP_BY",
         parameters = Map("value" -> "c2"),
         sqlState = None,
@@ -548,7 +548,7 @@ class SubquerySuite extends QueryTest
     }
     checkError(
       exception1,
-      errorClass = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
+      condition = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
         "MUST_AGGREGATE_CORRELATED_SCALAR_SUBQUERY",
       parameters = Map.empty,
       context = ExpectedContext(
@@ -558,7 +558,7 @@ class SubquerySuite extends QueryTest
     }
     checkErrorMatchPVals(
       exception2,
-      errorClass = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
+      condition = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
         "MUST_AGGREGATE_CORRELATED_SCALAR_SUBQUERY",
       parameters = Map.empty[String, String],
       sqlState = None,
@@ -850,7 +850,7 @@ class SubquerySuite extends QueryTest
       }
       checkErrorMatchPVals(
         exception1,
-        errorClass = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
+        condition = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
           "ACCESSING_OUTER_QUERY_COLUMN_IS_NOT_ALLOWED",
         parameters = Map("treeNode" -> "(?s).*"),
         sqlState = None,
@@ -872,7 +872,7 @@ class SubquerySuite extends QueryTest
       }
       checkErrorMatchPVals(
         exception2,
-        errorClass = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
+        condition = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
           "ACCESSING_OUTER_QUERY_COLUMN_IS_NOT_ALLOWED",
         parameters = Map("treeNode" -> "(?s).*"),
         sqlState = None,
@@ -893,7 +893,7 @@ class SubquerySuite extends QueryTest
       }
       checkErrorMatchPVals(
         exception3,
-        errorClass = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
+        condition = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
           "ACCESSING_OUTER_QUERY_COLUMN_IS_NOT_ALLOWED",
         parameters = Map("treeNode" -> "(?s).*"),
         sqlState = None,
@@ -1057,7 +1057,7 @@ class SubquerySuite extends QueryTest
       }
       checkError(
         exception1,
-        errorClass = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.CORRELATED_REFERENCE",
+        condition = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.CORRELATED_REFERENCE",
         parameters = Map("sqlExprs" -> "\"explode(arr_c2)\""),
         context = ExpectedContext(
           fragment = "LATERAL VIEW explode(t2.arr_c2) q AS c2",
@@ -1098,7 +1098,7 @@ class SubquerySuite extends QueryTest
       checkError(
         exception =
           intercept[AnalysisException](sql(query)),
-        errorClass = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+        condition = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
         sqlState = None,
         parameters = Map(
           "objectName" -> "`a`",
@@ -2530,24 +2530,37 @@ class SubquerySuite extends QueryTest
         Row(2))
 
       // Cannot use non-orderable data type in one row subquery that cannot be collapsed.
-      checkError(
-        exception = intercept[AnalysisException] {
-          sql(
-            """select (
-              |  select concat(a, a) from
-              |  (select upper(x['a'] + rand()) as a)
-              |) from v1
-              |""".stripMargin
-          ).collect()
-        },
-        errorClass = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
-          "UNSUPPORTED_CORRELATED_REFERENCE_DATA_TYPE",
-        parameters = Map("expr" -> "v1.x", "dataType" -> "map"),
-        context = ExpectedContext(
-          fragment = "select upper(x['a'] + rand()) as a",
-          start = 39,
-          stop = 72)
-      )
+      // However, this case is handled by rule PullOutNestedDataOuterRefExpressions.
+      // We test a non-deterministic function to prevent the expression from being collapsed, so
+      // we can't checkAnswer.
+      assert(sql(
+        """select (
+          |  select concat(a, a) from
+          |  (select upper(x['a'] + rand()) as a)
+          |) from v1
+          |""".stripMargin).collect().length == 1)
+
+      // With PullOutNestedDataOuterRefExpressions disabled, this query should fail.
+      withSQLConf(SQLConf.PULL_OUT_NESTED_DATA_OUTER_REF_EXPRESSIONS_ENABLED.key -> "false") {
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql(
+              """select (
+                |  select concat(a, a) from
+                |  (select upper(x['a'] + rand()) as a)
+                |) from v1
+                |""".stripMargin
+            ).collect()
+          },
+          condition = "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY." +
+            "UNSUPPORTED_CORRELATED_REFERENCE_DATA_TYPE",
+          parameters = Map("expr" -> "v1.x", "dataType" -> "map"),
+          context = ExpectedContext(
+            fragment = "select upper(x['a'] + rand()) as a",
+            start = 39,
+            stop = 72)
+        )
+      }
     }
   }
 

@@ -22,6 +22,7 @@ import io.fabric8.kubernetes.api.model.Pod
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.submit.{JavaMainAppResource, MainAppResource}
+import org.apache.spark.util.{Clock, SystemClock}
 
 /**
  * Builder methods for KubernetesConf that allow easy control over what to return for a few
@@ -52,7 +53,8 @@ object KubernetesTestConf {
       secretEnvNamesToKeyRefs: Map[String, String] = Map.empty,
       secretNamesToMountPaths: Map[String, String] = Map.empty,
       volumes: Seq[KubernetesVolumeSpec] = Seq.empty,
-      proxyUser: Option[String] = None): KubernetesDriverConf = {
+      proxyUser: Option[String] = None,
+      clock: Clock = new SystemClock()): KubernetesDriverConf = {
     val conf = sparkConf.clone()
 
     resourceNamePrefix.foreach { prefix =>
@@ -67,7 +69,7 @@ object KubernetesTestConf {
     setPrefixedConfigs(conf, KUBERNETES_DRIVER_SECRET_KEY_REF_PREFIX, secretEnvNamesToKeyRefs)
     setVolumeSpecs(conf, KUBERNETES_DRIVER_VOLUMES_PREFIX, volumes)
 
-    new KubernetesDriverConf(conf, appId, mainAppResource, mainClass, appArgs, proxyUser)
+    new KubernetesDriverConf(conf, appId, mainAppResource, mainClass, appArgs, proxyUser, clock)
   }
   // scalastyle:on argcount
 
@@ -115,12 +117,17 @@ object KubernetesTestConf {
           (KUBERNETES_VOLUMES_HOSTPATH_TYPE,
             Map(KUBERNETES_VOLUMES_OPTIONS_PATH_KEY -> path))
 
-        case KubernetesPVCVolumeConf(claimName, storageClass, sizeLimit) =>
+        case KubernetesPVCVolumeConf(claimName, storageClass, sizeLimit, labels) =>
           val sconf = storageClass
             .map { s => (KUBERNETES_VOLUMES_OPTIONS_CLAIM_STORAGE_CLASS_KEY, s) }.toMap
           val lconf = sizeLimit.map { l => (KUBERNETES_VOLUMES_OPTIONS_SIZE_LIMIT_KEY, l) }.toMap
+          val llabels = labels match {
+            case Some(value) => value.map { case(k, v) => s"label.$k" -> v }
+            case None => Map()
+          }
           (KUBERNETES_VOLUMES_PVC_TYPE,
-            Map(KUBERNETES_VOLUMES_OPTIONS_CLAIM_NAME_KEY -> claimName) ++ sconf ++ lconf)
+            Map(KUBERNETES_VOLUMES_OPTIONS_CLAIM_NAME_KEY -> claimName) ++
+              sconf ++ lconf ++ llabels)
 
         case KubernetesEmptyDirVolumeConf(medium, sizeLimit) =>
           val mconf = medium.map { m => (KUBERNETES_VOLUMES_OPTIONS_MEDIUM_KEY, m) }.toMap

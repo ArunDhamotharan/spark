@@ -22,8 +22,11 @@ import org.apache.spark.sql.catalyst.analysis.ExpressionBuilder
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.util.CollationFactory
 import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.types.StringTypeAnyCollation
 import org.apache.spark.sql.types._
 
+// scalastyle:off line.contains.tab
 @ExpressionDescription(
   usage = "_FUNC_(expr, collationName) - Marks a given expression with the specified collation.",
   arguments = """
@@ -33,24 +36,25 @@ import org.apache.spark.sql.types._
   """,
   examples = """
     Examples:
-      > SELECT COLLATION('Spark SQL' _FUNC_ 'UCS_BASIC_LCASE');
-       UCS_BASIC_LCASE
+      > SELECT COLLATION('Spark SQL' _FUNC_ UTF8_LCASE);
+      UTF8_LCASE
   """,
   since = "4.0.0",
   group = "string_funcs")
+// scalastyle:on line.contains.tab
 object CollateExpressionBuilder extends ExpressionBuilder {
   override def build(funcName: String, expressions: Seq[Expression]): Expression = {
     expressions match {
       case Seq(e: Expression, collationExpr: Expression) =>
         (collationExpr.dataType, collationExpr.foldable) match {
-          case (StringType, true) =>
+          case (_: StringType, true) =>
             val evalCollation = collationExpr.eval()
             if (evalCollation == null) {
               throw QueryCompilationErrors.unexpectedNullError("collation", collationExpr)
             } else {
               Collate(e, evalCollation.toString)
             }
-          case (StringType, false) => throw QueryCompilationErrors.nonFoldableArgumentError(
+          case (_: StringType, false) => throw QueryCompilationErrors.nonFoldableArgumentError(
             funcName, "collationName", StringType)
           case (_, _) => throw QueryCompilationErrors.unexpectedInputDataTypeError(
             funcName, 1, StringType, collationExpr)
@@ -69,7 +73,7 @@ case class Collate(child: Expression, collationName: String)
   extends UnaryExpression with ExpectsInputTypes {
   private val collationId = CollationFactory.collationNameToId(collationName)
   override def dataType: DataType = StringType(collationId)
-  override def inputTypes: Seq[AbstractDataType] = Seq(StringType)
+  override def inputTypes: Seq[AbstractDataType] = Seq(StringTypeAnyCollation)
 
   override protected def withNewChildInternal(
     newChild: Expression): Expression = copy(newChild)
@@ -78,23 +82,34 @@ case class Collate(child: Expression, collationName: String)
 
   override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode =
     defineCodeGen(ctx, ev, (in) => in)
+
+  override def sql: String = s"$prettyName(${child.sql}, $collationName)"
+
+  override def toString: String = s"$prettyName($child, $collationName)"
 }
 
+// scalastyle:off line.contains.tab
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the collation name of a given expression.",
+  arguments = """
+    Arguments:
+      * expr - String expression to perform collation on.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_('Spark SQL');
-       UCS_BASIC
+      UTF8_BINARY
   """,
   since = "4.0.0",
   group = "string_funcs")
-case class Collation(child: Expression) extends UnaryExpression with RuntimeReplaceable {
-  override def dataType: DataType = StringType
+// scalastyle:on line.contains.tab
+case class Collation(child: Expression)
+  extends UnaryExpression with RuntimeReplaceable with ExpectsInputTypes {
   override protected def withNewChildInternal(newChild: Expression): Collation = copy(newChild)
-  override def replacement: Expression = {
+  override lazy val replacement: Expression = {
     val collationId = child.dataType.asInstanceOf[StringType].collationId
     val collationName = CollationFactory.fetchCollation(collationId).collationName
-    Literal.create(collationName, StringType)
+    Literal.create(collationName, SQLConf.get.defaultStringType)
   }
+  override def inputTypes: Seq[AbstractDataType] = Seq(StringTypeAnyCollation)
 }

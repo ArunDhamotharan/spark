@@ -448,7 +448,7 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper with 
     }.getCause
     checkError(
       exception = exception.asInstanceOf[SparkException],
-      errorClass = "MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION",
+      condition = "MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION",
       parameters = Map("badRecord" -> "[null]", "failFastMode" -> "FAILFAST")
     )
   }
@@ -898,5 +898,12 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper with 
           )
         )
     }
+  }
+
+  test("SPARK-46761: support ? characters") {
+    checkEvaluation(
+      GetJsonObject(Literal(s"""{"?":"QUESTION"}"""), Literal("$['?']")),
+      "QUESTION"
+    )
   }
 }
