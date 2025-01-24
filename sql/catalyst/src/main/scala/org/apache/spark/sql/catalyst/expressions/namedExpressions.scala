@@ -28,6 +28,7 @@ import org.apache.spark.sql.catalyst.trees.TreePattern
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.types._
 import org.apache.spark.sql.catalyst.util.{quoteIfNeeded, METADATA_COL_ATTR_KEY}
+import org.apache.spark.sql.connector.catalog.MetadataColumn
 import org.apache.spark.sql.types._
 import org.apache.spark.util.collection.BitSet
 import org.apache.spark.util.collection.ImmutableBitSet
@@ -104,7 +105,8 @@ trait NamedExpression extends Expression {
   def newInstance(): NamedExpression
 }
 
-abstract class Attribute extends LeafExpression with NamedExpression with NullIntolerant {
+abstract class Attribute extends LeafExpression with NamedExpression {
+  override def nullIntolerant: Boolean = true
 
   @transient
   override lazy val references: AttributeSet = AttributeSet(this)
@@ -205,10 +207,18 @@ case class Alias(child: Expression, name: String)(
     ""
   }
 
+  /**
+   * This function is performance-sensitive, so we should avoid `MetadataBuilder` manipulation,
+   * because it performs heavy operations on maps
+   */
   private def removeNonInheritableMetadata(metadata: Metadata): Metadata = {
-    val builder = new MetadataBuilder().withMetadata(metadata)
-    nonInheritableMetadataKeys.foreach(builder.remove)
-    builder.build()
+    if (metadata.isEmpty || nonInheritableMetadataKeys.forall(!metadata.contains(_))) {
+      metadata
+    } else {
+      val builder = new MetadataBuilder().withMetadata(metadata)
+      nonInheritableMetadataKeys.foreach(builder.remove)
+      builder.build()
+    }
   }
 
   override def toString: String = s"$child AS $name#${exprId.id}$typeSuffix$delaySuffix"
@@ -494,8 +504,41 @@ object MetadataAttribute {
     .putString(METADATA_COL_ATTR_KEY, name)
     .build()
 
+  def metadata(col: MetadataColumn): Metadata = {
+    val builder = new MetadataBuilder()
+    if (col.metadataInJSON != null) {
+      builder.withMetadata(Metadata.fromJson(col.metadataInJSON))
+    }
+    builder.putString(METADATA_COL_ATTR_KEY, col.name)
+    builder.build()
+  }
+
   def isValid(metadata: Metadata): Boolean =
     metadata.contains(METADATA_COL_ATTR_KEY)
+
+  def isPreservedOnDelete(attr: Attribute): Boolean = {
+    if (attr.metadata.contains(MetadataColumn.PRESERVE_ON_DELETE)) {
+      attr.metadata.getBoolean(MetadataColumn.PRESERVE_ON_DELETE)
+    } else {
+      MetadataColumn.PRESERVE_ON_DELETE_DEFAULT
+    }
+  }
+
+  def isPreservedOnUpdate(attr: Attribute): Boolean = {
+    if (attr.metadata.contains(MetadataColumn.PRESERVE_ON_UPDATE)) {
+      attr.metadata.getBoolean(MetadataColumn.PRESERVE_ON_UPDATE)
+    } else {
+      MetadataColumn.PRESERVE_ON_UPDATE_DEFAULT
+    }
+  }
+
+  def isPreservedOnReinsert(attr: Attribute): Boolean = {
+    if (attr.metadata.contains(MetadataColumn.PRESERVE_ON_REINSERT)) {
+      attr.metadata.getBoolean(MetadataColumn.PRESERVE_ON_REINSERT)
+    } else {
+      MetadataColumn.PRESERVE_ON_REINSERT_DEFAULT
+    }
+  }
 }
 
 /**

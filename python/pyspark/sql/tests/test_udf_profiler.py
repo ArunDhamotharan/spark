@@ -26,14 +26,16 @@ from io import StringIO
 from typing import Iterator, cast
 
 from pyspark import SparkConf
+from pyspark.errors import PySparkValueError
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, pandas_udf, udf
 from pyspark.sql.window import Window
 from pyspark.profiler import UDFBasicProfiler
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
     have_pandas,
     have_pyarrow,
+    have_flameprof,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
@@ -82,7 +84,7 @@ class UDFProfilerTests(unittest.TestCase):
         finally:
             sys.stdout = old_stdout
 
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(prefix="test_udf_profiler") as d:
             self.sc.dump_profiles(d)
 
             for i, udf_name in enumerate(["add1", "add2", "add1", "add2"]):
@@ -183,22 +185,25 @@ class UDFProfiler2TestsMixin:
         self.assertEqual(3, len(self.profile_results), str(list(self.profile_results)))
 
         with self.trap_stdout() as io_all:
-            self.spark.showPerfProfiles()
+            self.spark.profile.show(type="perf")
 
-        with tempfile.TemporaryDirectory() as d:
-            self.spark.dumpPerfProfiles(d)
+        with tempfile.TemporaryDirectory(prefix="test_perf_profiler_udf") as d:
+            self.spark.profile.dump(d, type="perf")
 
             for id in self.profile_results:
                 self.assertIn(f"Profile of UDF<id={id}>", io_all.getvalue())
 
                 with self.trap_stdout() as io:
-                    self.spark.showPerfProfiles(id)
+                    self.spark.profile.show(id, type="perf")
 
                 self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
                 self.assertRegex(
                     io.getvalue(), f"10.*{os.path.basename(inspect.getfile(_do_computation))}"
                 )
                 self.assertTrue(f"udf_{id}_perf.pstats" in os.listdir(d))
+
+                if have_flameprof:
+                    self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -212,12 +217,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"10.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     def test_perf_profiler_udf_multiple_actions(self):
         def action(df):
@@ -231,12 +239,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"20.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     def test_perf_profiler_udf_registered(self):
         @udf("long")
@@ -252,12 +263,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"10.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -282,12 +296,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"2.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -315,12 +332,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"2.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -362,12 +382,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"5.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -391,12 +414,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"2.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -419,12 +445,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"2.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -454,12 +483,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"2.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -485,12 +517,15 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"2.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
@@ -514,12 +549,101 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"2.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if have_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
+
+    def test_perf_profiler_render(self):
+        with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
+            _do_computation(self.spark)
+        self.assertEqual(3, len(self.profile_results), str(list(self.profile_results)))
+
+        id = list(self.profile_results.keys())[0]
+
+        if have_flameprof:
+            self.assertIn("svg", self.spark.profile.render(id))
+            self.assertIn("svg", self.spark.profile.render(id, type="perf"))
+            self.assertIn("svg", self.spark.profile.render(id, renderer="flameprof"))
+
+        with self.assertRaises(PySparkValueError) as pe:
+            self.spark.profile.render(id, type="unknown")
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_NOT_ALLOWED",
+            messageParameters={
+                "arg_name": "type",
+                "allowed_values": "['perf', 'memory']",
+            },
+        )
+
+        with self.assertRaises(PySparkValueError) as pe:
+            self.spark.profile.render(id, type="memory")
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_NOT_ALLOWED",
+            messageParameters={
+                "arg_name": "(type, renderer)",
+                "allowed_values": "[('perf', None), ('perf', 'flameprof')]",
+            },
+        )
+
+        with self.assertRaises(PySparkValueError) as pe:
+            self.spark.profile.render(id, renderer="unknown")
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_NOT_ALLOWED",
+            messageParameters={
+                "arg_name": "(type, renderer)",
+                "allowed_values": "[('perf', None), ('perf', 'flameprof')]",
+            },
+        )
+
+        with self.trap_stdout() as io:
+            self.spark.profile.show(id, type="perf")
+        show_value = io.getvalue()
+
+        with self.trap_stdout() as io:
+            self.spark.profile.render(
+                id, renderer=lambda s: s.sort_stats("time", "cumulative").print_stats()
+            )
+        render_value = io.getvalue()
+
+        self.assertIn(render_value, show_value)
+
+    def test_perf_profiler_clear(self):
+        with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
+            _do_computation(self.spark)
+        self.assertEqual(3, len(self.profile_results), str(list(self.profile_results)))
+
+        for id in self.profile_results:
+            self.spark.profile.clear(id)
+            self.assertNotIn(id, self.profile_results)
+        self.assertEqual(0, len(self.profile_results), str(list(self.profile_results)))
+
+        with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
+            _do_computation(self.spark)
+        self.assertEqual(3, len(self.profile_results), str(list(self.profile_results)))
+
+        self.spark.profile.clear(type="memory")
+        self.assertEqual(3, len(self.profile_results), str(list(self.profile_results)))
+        self.spark.profile.clear(type="perf")
+        self.assertEqual(0, len(self.profile_results), str(list(self.profile_results)))
+
+        with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
+            _do_computation(self.spark)
+        self.assertEqual(3, len(self.profile_results), str(list(self.profile_results)))
+
+        self.spark.profile.clear()
+        self.assertEqual(0, len(self.profile_results), str(list(self.profile_results)))
 
 
 class UDFProfiler2Tests(UDFProfiler2TestsMixin, ReusedSQLTestCase):

@@ -95,6 +95,8 @@ class _CrossValidatorParams(_ValidatorParams):
     Params for :py:class:`CrossValidator` and :py:class:`CrossValidatorModel`.
 
     .. versionadded:: 3.5.0
+
+    .. deprecated:: 4.0.0
     """
 
     numFolds: Param[int] = Param(
@@ -170,7 +172,7 @@ def _parallelFitTasks(
 
     if active_session is None:
         raise RuntimeError(
-            "An active SparkSession is required for running cross valiator fit tasks."
+            "An active SparkSession is required for running cross validator fit tasks."
         )
 
     def get_single_task(index: int, param_map: Any) -> Callable[[], Tuple[int, float]]:
@@ -179,7 +181,7 @@ def _parallelFitTasks(
                 # Active session is thread-local variable, in background thread the active session
                 # is not set, the following line sets it as the main thread active session.
                 active_session._jvm.SparkSession.setActiveSession(  # type: ignore[union-attr]
-                    active_session._jsparkSession  # type: ignore[union-attr]
+                    active_session._jsparkSession
                 )
 
             model = estimator.fit(train, param_map)
@@ -279,6 +281,8 @@ class CrossValidator(
     test set exactly once.
 
     .. versionadded:: 3.5.0
+
+    .. deprecated:: 4.0.0
 
     Examples
     --------
@@ -493,8 +497,9 @@ class CrossValidator(
         and some extra params. This copies creates a deep copy of
         the embedded paramMap, and copies the embedded and extra parameters over.
 
-
         .. versionadded:: 3.5.0
+
+        .. deprecated:: 4.0.0
 
         Parameters
         ----------
@@ -524,6 +529,8 @@ class CrossValidatorModel(Model, _CrossValidatorParams, _CrossValidatorReadWrite
     also tracks the metrics for each param map evaluated.
 
     .. versionadded:: 3.5.0
+
+    .. deprecated:: 4.0.0
     """
 
     def __init__(
@@ -554,6 +561,8 @@ class CrossValidatorModel(Model, _CrossValidatorParams, _CrossValidatorReadWrite
         It does not copy the extra Params into the subModels.
 
         .. versionadded:: 3.5.0
+
+        .. deprecated:: 4.0.0
 
         Parameters
         ----------

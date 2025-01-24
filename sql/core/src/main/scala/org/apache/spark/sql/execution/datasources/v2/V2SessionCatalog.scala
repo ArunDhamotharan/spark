@@ -24,8 +24,8 @@ import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 import org.apache.spark.SparkUnsupportedOperationException
-import org.apache.spark.sql.catalyst.{FunctionIdentifier, SQLConfHelper, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, TableAlreadyExistsException}
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, QualifiedTableName, SQLConfHelper, TableIdentifier}
+import org.apache.spark.sql.catalyst.analysis.{NoSuchNamespaceException, NoSuchTableException, TableAlreadyExistsException}
 import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogStorageFormat, CatalogTable, CatalogTableType, CatalogUtils, ClusterBySpec, SessionCatalog}
 import org.apache.spark.sql.catalyst.util.TypeUtils._
 import org.apache.spark.sql.connector.catalog.{CatalogManager, CatalogV2Util, Column, FunctionCatalog, Identifier, NamespaceChange, SupportsNamespaces, Table, TableCatalog, TableCatalogCapability, TableChange, V1Table}
@@ -39,6 +39,7 @@ import org.apache.spark.sql.internal.connector.V1Function
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.Utils
 
 /**
  * A [[TableCatalog]] that translates calls to the v1 SessionCatalog.
@@ -68,7 +69,7 @@ class V2SessionCatalog(catalog: SessionCatalog)
           .map(ident => Identifier.of(ident.database.map(Array(_)).getOrElse(Array()), ident.table))
           .toArray
       case _ =>
-        throw QueryCompilationErrors.noSuchNamespaceError(namespace)
+        throw QueryCompilationErrors.noSuchNamespaceError(name() +: namespace)
     }
   }
 
@@ -81,10 +82,23 @@ class V2SessionCatalog(catalog: SessionCatalog)
     new CaseInsensitiveStringMap(propertiesWithPath.asJava)
   }
 
+  private def hasCustomSessionCatalog: Boolean = {
+    catalog.conf.getConf(SQLConf.V2_SESSION_CATALOG_IMPLEMENTATION) != "builtin"
+  }
+
   override def loadTable(ident: Identifier): Table = {
     try {
       val table = catalog.getTableMetadata(ident.asTableIdentifier)
-      if (table.provider.isDefined) {
+      // The custom session catalog may extend `DelegatingCatalogExtension` and rely on the returned
+      // table here. To avoid breaking it we do not resolve the table provider and still return
+      // `V1Table` if the custom session catalog is present.
+      if (table.provider.isDefined && !hasCustomSessionCatalog) {
+        val qualifiedTableName = QualifiedTableName(
+          table.identifier.catalog.get, table.database, table.identifier.table)
+        // Check if the table is in the v1 table cache to skip the v2 table lookup.
+        if (catalog.getCachedTable(qualifiedTableName) != null) {
+          return V1Table(table)
+        }
         DataSourceV2Utils.getTableProvider(table.provider.get, conf) match {
           case Some(provider) =>
             // Get the table properties during creation and append the path option
@@ -111,7 +125,7 @@ class V2SessionCatalog(catalog: SessionCatalog)
         V1Table(table)
       }
     } catch {
-      case _: NoSuchDatabaseException =>
+      case _: NoSuchNamespaceException =>
         throw QueryCompilationErrors.noSuchTableError(ident)
     }
   }
@@ -146,16 +160,7 @@ class V2SessionCatalog(catalog: SessionCatalog)
     catalog.refreshTable(ident.asTableIdentifier)
   }
 
-  override def createTable(
-      ident: Identifier,
-      columns: Array[Column],
-      partitions: Array[Transform],
-      properties: util.Map[String, String]): Table = {
-    createTable(ident, CatalogV2Util.v2ColumnsToStructType(columns), partitions, properties)
-  }
-
-  // TODO: remove it when no tests calling this deprecated method.
-  override def createTable(
+  private def createTable0(
       ident: Identifier,
       schema: StructType,
       partitions: Array[Transform],
@@ -167,7 +172,9 @@ class V2SessionCatalog(catalog: SessionCatalog)
     val storage = DataSource.buildStorageFormatFromOptions(toOptions(tableProperties))
       .copy(locationUri = location.map(CatalogUtils.stringToURI))
     val isExternal = properties.containsKey(TableCatalog.PROP_EXTERNAL)
-    val tableType = if (isExternal || location.isDefined) {
+    val isManagedLocation = Option(properties.get(TableCatalog.PROP_IS_MANAGED_LOCATION))
+      .exists(_.equalsIgnoreCase("true"))
+    val tableType = if (isExternal || (location.isDefined && !isManagedLocation)) {
       CatalogTableType.EXTERNAL
     } else {
       CatalogTableType.MANAGED
@@ -232,7 +239,8 @@ class V2SessionCatalog(catalog: SessionCatalog)
         maybeClusterBySpec.map(
           clusterBySpec => ClusterBySpec.toProperty(newSchema, clusterBySpec, conf.resolver)),
       tracksPartitionsInCatalog = conf.manageFilesourcePartitions,
-      comment = Option(properties.get(TableCatalog.PROP_COMMENT)))
+      comment = Option(properties.get(TableCatalog.PROP_COMMENT)),
+      collation = Option(properties.get(TableCatalog.PROP_COLLATION)))
 
     try {
       catalog.createTable(tableDesc, ignoreIfExists = false)
@@ -242,6 +250,25 @@ class V2SessionCatalog(catalog: SessionCatalog)
     }
 
     null // Return null to save the `loadTable` call for CREATE TABLE without AS SELECT.
+  }
+
+  override def createTable(
+      ident: Identifier,
+      schema: StructType,
+      partitions: Array[Transform],
+      properties: util.Map[String, String]): Table = {
+    if (Utils.isTesting) {
+      throw QueryCompilationErrors.createTableDeprecatedError()
+    }
+    createTable0(ident, schema, partitions, properties)
+  }
+
+  override def createTable(
+      ident: Identifier,
+      columns: Array[Column],
+      partitions: Array[Transform],
+      properties: util.Map[String, String]): Table = {
+    createTable0(ident, CatalogV2Util.v2ColumnsToStructType(columns), partitions, properties)
   }
 
   private def toOptions(properties: Map[String, String]): Map[String, String] = {
@@ -264,6 +291,7 @@ class V2SessionCatalog(catalog: SessionCatalog)
     val schema = CatalogV2Util.applySchemaChanges(
       catalogTable.schema, changes, catalogTable.provider, "ALTER TABLE")
     val comment = properties.get(TableCatalog.PROP_COMMENT)
+    val collation = properties.get(TableCatalog.PROP_COLLATION)
     val owner = properties.getOrElse(TableCatalog.PROP_OWNER, catalogTable.owner)
     val location = properties.get(TableCatalog.PROP_LOCATION).map(CatalogUtils.stringToURI)
     val storage = if (location.isDefined) {
@@ -272,11 +300,12 @@ class V2SessionCatalog(catalog: SessionCatalog)
       catalogTable.storage
     }
 
+    val finalProperties = CatalogV2Util.applyClusterByChanges(properties, schema, changes)
     try {
       catalog.alterTable(
         catalogTable.copy(
-          properties = properties, schema = schema, owner = owner, comment = comment,
-          storage = storage))
+          properties = finalProperties, schema = schema, owner = owner, comment = comment,
+          collation = collation, storage = storage))
     } catch {
       case _: NoSuchTableException =>
         throw QueryCompilationErrors.noSuchTableError(ident)
@@ -367,7 +396,7 @@ class V2SessionCatalog(catalog: SessionCatalog)
       case Array(db) if catalog.databaseExists(db) =>
         Array()
       case _ =>
-        throw QueryCompilationErrors.noSuchNamespaceError(namespace)
+        throw QueryCompilationErrors.noSuchNamespaceError(name() +: namespace)
     }
   }
 
@@ -377,12 +406,12 @@ class V2SessionCatalog(catalog: SessionCatalog)
         try {
           catalog.getDatabaseMetadata(db).toMetadata
         } catch {
-          case _: NoSuchDatabaseException =>
-            throw QueryCompilationErrors.noSuchNamespaceError(namespace)
+          case _: NoSuchNamespaceException =>
+            throw QueryCompilationErrors.noSuchNamespaceError(name() +: namespace)
         }
 
       case _ =>
-        throw QueryCompilationErrors.noSuchNamespaceError(namespace)
+        throw QueryCompilationErrors.noSuchNamespaceError(name() +: namespace)
     }
   }
 
@@ -417,7 +446,7 @@ class V2SessionCatalog(catalog: SessionCatalog)
           toCatalogDatabase(db, CatalogV2Util.applyNamespaceChanges(metadata, changes)))
 
       case _ =>
-        throw QueryCompilationErrors.noSuchNamespaceError(namespace)
+        throw QueryCompilationErrors.noSuchNamespaceError(name() +: namespace)
     }
   }
 
@@ -433,7 +462,7 @@ class V2SessionCatalog(catalog: SessionCatalog)
       false
 
     case _ =>
-      throw QueryCompilationErrors.noSuchNamespaceError(namespace)
+      throw QueryCompilationErrors.noSuchNamespaceError(name() +: namespace)
   }
 
   def isTempView(ident: Identifier): Boolean = {
@@ -452,7 +481,7 @@ class V2SessionCatalog(catalog: SessionCatalog)
           Identifier.of(Array(funcIdent.database.get), funcIdent.identifier)
         }.toArray
       case _ =>
-        throw QueryCompilationErrors.noSuchNamespaceError(namespace)
+        throw QueryCompilationErrors.noSuchNamespaceError(name() +: namespace)
     }
   }
 

@@ -44,7 +44,7 @@ from pyspark.ml.util import (
     JavaMLReadable,
     GeneralJavaMLWritable,
     HasTrainingSummary,
-    SparkContext,
+    try_remote_attribute_relation,
 )
 from pyspark.ml.wrapper import JavaEstimator, JavaModel, JavaParams, JavaWrapper
 from pyspark.ml.common import inherit_doc, _java2py
@@ -92,6 +92,7 @@ class ClusteringSummary(JavaWrapper):
 
     @property
     @since("2.1.0")
+    @try_remote_attribute_relation
     def predictions(self) -> DataFrame:
         """
         DataFrame produced by the model's `transform` method.
@@ -116,6 +117,7 @@ class ClusteringSummary(JavaWrapper):
 
     @property
     @since("2.1.0")
+    @try_remote_attribute_relation
     def cluster(self) -> DataFrame:
         """
         DataFrame of predicted cluster centers for each training data point.
@@ -226,6 +228,8 @@ class GaussianMixtureModel(
         Array of :py:class:`MultivariateGaussian` where gaussians[i] represents
         the Multivariate Gaussian (Normal) Distribution for Gaussian i
         """
+        from pyspark.core.context import SparkContext
+
         sc = SparkContext._active_spark_context
         assert sc is not None and self._java_obj is not None
 
@@ -237,6 +241,7 @@ class GaussianMixtureModel(
 
     @property
     @since("2.0.0")
+    @try_remote_attribute_relation
     def gaussiansDF(self) -> DataFrame:
         """
         Retrieve Gaussian distributions as a DataFrame.
@@ -538,6 +543,7 @@ class GaussianMixtureSummary(ClusteringSummary):
 
     @property
     @since("2.1.0")
+    @try_remote_attribute_relation
     def probability(self) -> DataFrame:
         """
         DataFrame of probabilities of each cluster for each training data point.

@@ -91,7 +91,7 @@ Then, you can supply configuration values at runtime:
 ```sh
 ./bin/spark-submit \
   --name "My app" \
-  --master local[4] \
+  --master "local[4]" \
   --conf spark.eventLog.enabled=false \
   --conf "spark.executor.extraJavaOptions=-XX:+PrintGCDetails -XX:+PrintGCTimeStamps" \
   myApp.jar
@@ -103,20 +103,25 @@ such as `--master`, as shown above. `spark-submit` can accept any Spark property
 flag, but uses special flags for properties that play a part in launching the Spark application.
 Running `./bin/spark-submit --help` will show the entire list of these options.
 
-`bin/spark-submit` will also read configuration options from `conf/spark-defaults.conf`, in which
-each line consists of a key and a value separated by whitespace. For example:
+When configurations are specified via the `--conf/-c` flags, `bin/spark-submit` will also read
+configuration options from `conf/spark-defaults.conf`, in which each line consists of a key and
+a value separated by whitespace. For example:
 
     spark.master            spark://5.6.7.8:7077
     spark.executor.memory   4g
     spark.eventLog.enabled  true
     spark.serializer        org.apache.spark.serializer.KryoSerializer
 
+In addition, a property file with Spark configurations can be passed to `bin/spark-submit` via
+`--properties-file` parameter. When this is set, Spark will no longer load configurations from
+`conf/spark-defaults.conf` unless another parameter `--load-spark-defaults` is provided.
+
 Any values specified as flags or in the properties file will be passed on to the application
 and merged with those specified through SparkConf. Properties set directly on the SparkConf
-take highest precedence, then flags passed to `spark-submit` or `spark-shell`, then options
-in the `spark-defaults.conf` file. A few configuration keys have been renamed since earlier
-versions of Spark; in such cases, the older key names are still accepted, but take lower
-precedence than any instance of the newer key.
+take the highest precedence, then those through `--conf` flags or `--properties-file` passed to
+`spark-submit` or `spark-shell`, then options in the `spark-defaults.conf` file. A few
+configuration keys have been renamed since earlier versions of Spark; in such cases, the older
+key names are still accepted, but take lower precedence than any instance of the newer key.
 
 Spark properties mainly can be divided into two kinds: one is related to deploy, like
 "spark.driver.memory", "spark.executor.instances", this kind of properties may not be affected when
@@ -187,7 +192,7 @@ of the most common options to set are:
 </tr>
 <tr>
   <td><code>spark.driver.memoryOverhead</code></td>
-  <td>driverMemory * <code>spark.driver.memoryOverheadFactor</code>, with minimum of 384 </td>
+  <td>driverMemory * <code>spark.driver.memoryOverheadFactor</code>, with minimum of <code>spark.driver.minMemoryOverhead</code></td>
   <td>
     Amount of non-heap memory to be allocated per driver process in cluster mode, in MiB unless
     otherwise specified. This is memory that accounts for things like VM overheads, interned strings,
@@ -201,6 +206,15 @@ of the most common options to set are:
     and <code>spark.driver.memory</code>.
   </td>
   <td>2.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.driver.minMemoryOverhead</code></td>
+  <td>384m</td>
+  <td>
+    The minimum amount of non-heap memory to be allocated per driver process in cluster mode, in MiB unless otherwise specified, if <code>spark.driver.memoryOverhead</code> is not defined.
+    This option is currently supported on YARN and Kubernetes.
+  </td>
+  <td>4.0.0</td>
 </tr>
 <tr>
   <td><code>spark.driver.memoryOverheadFactor</code></td>
@@ -283,7 +297,7 @@ of the most common options to set are:
     shared with other non-JVM processes. When PySpark is run in YARN or Kubernetes, this memory
     is added to executor resource requests.
     <br/>
-    <em>Note:</em> This feature is dependent on Python's `resource` module; therefore, the behaviors and
+    <em>Note:</em> This feature is dependent on Python's <code>resource</code> module; therefore, the behaviors and
     limitations are inherited. For instance, Windows does not support resource limiting and actual
     resource is not limited on MacOS.
   </td>
@@ -291,7 +305,7 @@ of the most common options to set are:
 </tr>
 <tr>
  <td><code>spark.executor.memoryOverhead</code></td>
-  <td>executorMemory * <code>spark.executor.memoryOverheadFactor</code>, with minimum of 384 </td>
+  <td>executorMemory * <code>spark.executor.memoryOverheadFactor</code>, with minimum of <code>spark.executor.minMemoryOverhead</code></td>
   <td>
     Amount of additional memory to be allocated per executor process, in MiB unless otherwise specified.
     This is memory that accounts for things like VM overheads, interned strings, other native overheads, etc.
@@ -305,6 +319,15 @@ of the most common options to set are:
     <code>spark.executor.pyspark.memory</code>.
   </td>
   <td>2.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.driver.minMemoryOverhead</code></td>
+  <td>384m</td>
+  <td>
+    The minimum amount of non-heap memory to be allocated per executor process, in MiB unless otherwise specified, if <code>spark.executor.memoryOverhead</code> is not defined.
+    This option is currently supported on YARN and Kubernetes.
+  </td>
+  <td>4.0.0</td>
 </tr>
 <tr>
   <td><code>spark.executor.memoryOverheadFactor</code></td>
@@ -435,6 +458,17 @@ of the most common options to set are:
   <td>1.3.0</td>
 </tr>
 <tr>
+  <td><code>spark.driver.timeout</code></td>
+  <td>0min</td>
+  <td>
+    A timeout for Spark driver in minutes. 0 means infinite. For the positive time value,
+    terminate the driver with the exit code 124 if it runs after timeout duration. To use,
+    it's required to set <code>spark.plugins</code> with
+    <code>org.apache.spark.deploy.DriverTimeoutPlugin</code>.
+  </td>
+  <td>4.0.0</td>
+</tr>
+<tr>
   <td><code>spark.driver.log.localDir</code></td>
   <td>(none)</td>
   <td>
@@ -531,8 +565,7 @@ of the most common options to set are:
   <td>numExecutors * 2, with minimum of 3</td>
   <td>
     The maximum number of executor failures before failing the application.
-    This configuration only takes effect on YARN, or Kubernetes when 
-    `spark.kubernetes.allocation.pods.allocator` is set to 'direct'.
+    This configuration only takes effect on YARN and Kubernetes.
   </td>
   <td>3.5.0</td>
 </tr>
@@ -542,8 +575,7 @@ of the most common options to set are:
   <td>
     Interval after which executor failures will be considered independent and
     not accumulate towards the attempt count.
-    This configuration only takes effect on YARN, or Kubernetes when 
-    `spark.kubernetes.allocation.pods.allocator` is set to 'direct'.
+    This configuration only takes effect on YARN and Kubernetes.
   </td>
   <td>3.5.0</td>
 </tr>
@@ -760,7 +792,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.redaction.regex</code></td>
-  <td>(?i)secret|password|token|access[.]key</td>
+  <td>(?i)secret|password|token|access[.]?key</td>
   <td>
     Regex to decide which Spark configuration properties and environment variables in driver and
     executor environments contain sensitive information. When this regex matches a property key or
@@ -996,13 +1028,31 @@ Apart from these, the following properties are also available, and may be useful
   <td>1.4.0</td>
 </tr>
 <tr>
+  <td><code>spark.shuffle.file.merge.buffer</code></td>
+  <td>32k</td>
+  <td>
+    Size of the in-memory buffer for each shuffle file input stream, in KiB unless otherwise
+    specified. These buffers use off-heap buffers and are related to the number of files in
+    the shuffle file. Too large buffers should be avoided.
+  </td>
+  <td>4.0.0</td>
+</tr>
+<tr>
   <td><code>spark.shuffle.unsafe.file.output.buffer</code></td>
   <td>32k</td>
   <td>
-    The file system for this buffer size after each partition is written in unsafe shuffle writer.
-    In KiB unless otherwise specified.
+    Deprecated since Spark 4.0, please use <code>spark.shuffle.localDisk.file.output.buffer</code>.
   </td>
   <td>2.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.shuffle.localDisk.file.output.buffer</code></td>
+  <td>32k</td>
+  <td>
+    The file system for this buffer size after each partition is written in all local disk shuffle writers.
+    In KiB unless otherwise specified.
+  </td>
+  <td>4.0.0</td>
 </tr>
 <tr>
   <td><code>spark.shuffle.spill.diskWriteBufferSize</code></td>
@@ -1070,7 +1120,7 @@ Apart from these, the following properties are also available, and may be useful
   <td>
     Timeout for the established connections between shuffle servers and clients to be marked
     as idled and closed if there are still outstanding fetch requests but no traffic no the channel
-    for at least `connectionTimeout`.
+    for at least <code>connectionTimeout</code>.
   </td>
   <td>1.2.0</td>
 </tr>
@@ -1123,7 +1173,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.shuffle.service.removeShuffle</code></td>
-  <td>false</td>
+  <td>true</td>
   <td>
     Whether to use the ExternalShuffleService for deleting shuffle blocks for
     deallocated executors when the shuffle is no longer needed. Without this enabled,
@@ -1179,6 +1229,19 @@ Apart from these, the following properties are also available, and may be useful
     block size when fetch shuffle blocks.
   </td>
   <td>2.2.1</td>
+</tr>
+<tr>
+  <td><code>spark.shuffle.accurateBlockSkewedFactor</code></td>
+  <td>-1.0</td>
+  <td>
+    A shuffle block is considered as skewed and will be accurately recorded in
+    <code>HighlyCompressedMapStatus</code> if its size is larger than this factor multiplying
+    the median shuffle block size or <code>spark.shuffle.accurateBlockThreshold</code>. It is
+    recommended to set this parameter to be the same as
+    <code>spark.sql.adaptive.skewJoin.skewedPartitionFactor</code>. Set to -1.0 to disable this
+    feature by default.
+  </td>
+  <td>3.3.0</td>
 </tr>
 <tr>
   <td><code>spark.shuffle.registration.timeout</code></td>
@@ -1254,7 +1317,7 @@ Apart from these, the following properties are also available, and may be useful
   <td>
     Timeout for the established connections for fetching files in Spark RPC environments to be marked
     as idled and closed if there are still outstanding files being downloaded but no traffic no the channel
-    for at least `connectionTimeout`.
+    for at least <code>connectionTimeout</code>.
   </td>
   <td>1.6.0</td>
 </tr>
@@ -1280,7 +1343,7 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.shuffle.checksum.algorithm</code></td>
   <td>ADLER32</td>
   <td>
-    The algorithm is used to calculate the shuffle checksum. Currently, it only supports built-in algorithms of JDK, e.g., ADLER32, CRC32.
+    The algorithm is used to calculate the shuffle checksum. Currently, it only supports built-in algorithms of JDK, e.g., ADLER32, CRC32 and CRC32C.
   </td>
   <td>3.2.0</td>
 </tr>
@@ -1575,7 +1638,7 @@ Apart from these, the following properties are also available, and may be useful
     identically on all the workers, drivers and masters. In is only effective when
     <code>spark.ui.reverseProxy</code> is turned on. This setting is not needed when the Spark
     master web UI is directly reachable.<br/>
-    Note that the value of the setting can't contain the keyword `proxy` or `history` after split by "/". Spark UI relies on both keywords for getting REST API endpoints from URIs.
+    Note that the value of the setting can't contain the keyword <code>proxy</code> or <code>history</code> after split by "/". Spark UI relies on both keywords for getting REST API endpoints from URIs.
   </td>
   <td>2.1.0</td>
 </tr>
@@ -1624,7 +1687,7 @@ Apart from these, the following properties are also available, and may be useful
     which will be also effective when accessing the application on history server. The new log urls must be
     permanent, otherwise you might have dead link for executor log urls.
     <p/>
-    For now, only YARN mode supports this configuration
+    For now, only YARN and K8s cluster manager supports this configuration
   </td>
   <td>3.0.0</td>
 </tr>
@@ -1767,6 +1830,15 @@ Apart from these, the following properties are also available, and may be useful
   <td>0.6.0</td>
 </tr>
 <tr>
+  <td><code>spark.checkpoint.dir</code></td>
+  <td>(none)</td>
+  <td>
+    Set the default directory for checkpointing. It can be overwritten by
+    SparkContext.setCheckpointDir.
+  </td>
+  <td>4.0.0</td>
+</tr>
+<tr>
   <td><code>spark.checkpoint.compress</code></td>
   <td>false</td>
   <td>
@@ -1797,7 +1869,7 @@ Apart from these, the following properties are also available, and may be useful
     Block size used in LZ4 compression, in the case when LZ4 compression codec
     is used. Lowering this block size will also lower shuffle memory usage when LZ4 is used.
     Default unit is bytes, unless otherwise specified. This configuration only applies to
-    `spark.io.compression.codec`.
+    <code>spark.io.compression.codec</code>.
   </td>
   <td>1.4.0</td>
 </tr>
@@ -1808,7 +1880,7 @@ Apart from these, the following properties are also available, and may be useful
     Block size in Snappy compression, in the case when Snappy compression codec is used.
     Lowering this block size will also lower shuffle memory usage when Snappy is used.
     Default unit is bytes, unless otherwise specified. This configuration only applies
-    to `spark.io.compression.codec`.
+    to <code>spark.io.compression.codec</code>.
   </td>
   <td>1.4.0</td>
 </tr>
@@ -1818,7 +1890,7 @@ Apart from these, the following properties are also available, and may be useful
   <td>
     Compression level for Zstd compression codec. Increasing the compression level will result in better
     compression at the expense of more CPU and memory. This configuration only applies to
-    `spark.io.compression.codec`.
+    <code>spark.io.compression.codec</code>.
   </td>
   <td>2.3.0</td>
 </tr>
@@ -1829,7 +1901,7 @@ Apart from these, the following properties are also available, and may be useful
     Buffer size in bytes used in Zstd compression, in the case when Zstd compression codec
     is used. Lowering this size will lower the shuffle memory usage when Zstd is used, but it
     might increase the compression cost because of excessive JNI call overhead. This
-    configuration only applies to `spark.io.compression.codec`.
+    configuration only applies to <code>spark.io.compression.codec</code>.
   </td>
   <td>2.3.0</td>
 </tr>
@@ -1849,6 +1921,14 @@ Apart from these, the following properties are also available, and may be useful
     no worker is spawned, it works in single-threaded mode. When value > 0, it triggers
     asynchronous mode, corresponding number of threads are spawned. More workers improve
     performance, but also increase memory cost.
+  </td>
+  <td>4.0.0</td>
+</tr>
+<tr>
+  <td><code>spark.io.compression.lzf.parallel.enabled</code></td>
+  <td>false</td>
+  <td>
+    When true, LZF compression will use multiple threads to compress data in parallel.
   </td>
   <td>4.0.0</td>
 </tr>
@@ -2030,7 +2110,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.storage.replication.proactive</code></td>
-  <td>false</td>
+  <td>true</td>
   <td>
     Enables proactive block replication for RDD blocks. Cached RDD block replicas lost due to
     executor failures are replenished if there are any existing available replicas. This tries
@@ -2557,7 +2637,7 @@ Apart from these, the following properties are also available, and may be useful
   <td>
     Timeout for the established connections between RPC peers to be marked as idled and closed
     if there are outstanding RPC requests but no traffic on the channel for at least
-    `connectionTimeout`.
+    <code>connectionTimeout</code>.
   </td>
   <td>1.2.0</td>
 </tr>
@@ -2670,7 +2750,7 @@ Apart from these, the following properties are also available, and may be useful
   <td>10000</td>
   <td>
     The default capacity for event queues. Spark will try to initialize an event queue
-    using capacity specified by `spark.scheduler.listenerbus.eventqueue.queueName.capacity`
+    using capacity specified by <code>spark.scheduler.listenerbus.eventqueue.queueName.capacity</code>
     first. If it's not configured, Spark will use the default capacity specified by this
     config. Note that capacity must be greater than 0. Consider increasing value (e.g. 20000)
     if listener events are dropped. Increasing this value may result in the driver using more memory.
@@ -2766,8 +2846,35 @@ Apart from these, the following properties are also available, and may be useful
     If set to "true", prevent Spark from scheduling tasks on executors that have been excluded
     due to too many task failures. The algorithm used to exclude executors and nodes can be further
     controlled by the other "spark.excludeOnFailure" configuration options.
+    This config will be overridden by "spark.excludeOnFailure.application.enabled" and
+    "spark.excludeOnFailure.taskAndStage.enabled" to specify exclusion enablement on individual
+    levels.
   </td>
   <td>2.1.0</td>
+</tr>
+<tr>
+  <td><code>spark.excludeOnFailure.application.enabled</code></td>
+  <td>
+    false
+  </td>
+  <td>
+    If set to "true", enables excluding executors for the entire application due to too many task
+    failures and prevent Spark from scheduling tasks on them.
+    This config overrides "spark.excludeOnFailure.enabled". 
+  </td>
+  <td>4.0.0</td>
+</tr>
+<tr>
+  <td><code>spark.excludeOnFailure.taskAndStage.enabled</code></td>
+  <td>
+    false
+  </td>
+  <td>
+    If set to "true", enables excluding executors on a task set level due to too many task
+    failures and prevent Spark from scheduling tasks on them.
+    This config overrides "spark.excludeOnFailure.enabled". 
+  </td>
+  <td>4.0.0</td>
 </tr>
 <tr>
   <td><code>spark.excludeOnFailure.timeout</code></td>
@@ -2878,7 +2985,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.speculation.multiplier</code></td>
-  <td>1.5</td>
+  <td>3</td>
   <td>
     How many times slower a task is than the median to be considered for speculation.
   </td>
@@ -2886,7 +2993,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.speculation.quantile</code></td>
-  <td>0.75</td>
+  <td>0.9</td>
   <td>
     Fraction of tasks which must be complete before speculation is enabled for a particular stage.
   </td>
@@ -3043,7 +3150,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.stage.ignoreDecommissionFetchFailure</code></td>
-  <td>false</td>
+  <td>true</td>
   <td>
     Whether ignore stage fetch failure caused by executor decommission when
     count <code>spark.stage.maxConsecutiveAttempts</code>
@@ -3151,7 +3258,7 @@ Apart from these, the following properties are also available, and may be useful
   <td>
     Initial number of executors to run if dynamic allocation is enabled.
     <br /><br />
-    If `--num-executors` (or `spark.executor.instances`) is set and larger than this value, it will
+    If <code>--num-executors</code> (or <code>spark.executor.instances</code>) is set and larger than this value, it will
     be used as the initial number of executors.
   </td>
   <td>1.3.0</td>
@@ -3358,7 +3465,7 @@ Spark subsystems.
 
 Runtime SQL configurations are per-session, mutable Spark SQL configurations. They can be set with initial values by the config file
 and command-line options with `--conf/-c` prefixed, or by setting `SparkConf` that are used to create `SparkSession`.
-Also, they can be set and queried by SET commands and rest to their initial values by RESET command,
+Also, they can be set and queried by SET commands and reset to their initial values by RESET command,
 or by `SparkSession.conf`'s setter and getter methods in runtime.
 
 {% include_api_gen generated-runtime-sql-config-table.html %}
@@ -3503,7 +3610,7 @@ External users can query the static sql config values via `SparkSession.conf` or
 </tr>
 </table>
 
-### SparkR
+### SparkR (deprecated)
 
 <table class="spark-config">
 <thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
@@ -3640,15 +3747,35 @@ Note: When running Spark on YARN in `cluster` mode, environment variables need t
 
 # Configuring Logging
 
-Spark uses [log4j](http://logging.apache.org/log4j/) for logging. You can configure it by adding a
-`log4j2.properties` file in the `conf` directory. One way to start is to copy the existing
-`log4j2.properties.template` located there.
+Spark uses [log4j](http://logging.apache.org/log4j/) for logging. You can configure it by adding a `log4j2.properties` file in the `conf` directory. To get started, copy one of the provided templates: `log4j2.properties.template` (for plain text logging) or `log4j2-json-layout.properties.template` (for structured logging).
 
-By default, Spark adds 1 record to the MDC (Mapped Diagnostic Context): `mdc.taskName`, which shows something
-like `task 1.0 in stage 0.0`. You can add `%X{mdc.taskName}` to your patternLayout in
-order to print it in the logs.
-Moreover, you can use `spark.sparkContext.setLocalProperty(s"mdc.$name", "value")` to add user specific data into MDC.
-The key in MDC will be the string of "mdc.$name".
+## Plain Text Logging
+The default logging format is plain text, using Log4j's [Pattern Layout](https://logging.apache.org/log4j/2.x/manual/pattern-layout.html).
+
+MDC (Mapped Diagnostic Context) information is not included by default in plain text logs. To include it, update the `PatternLayout` configuration in the `log4j2.properties` file. For example, add `%X{task_name}` to include the task name in logs. Additionally, use `spark.sparkContext.setLocalProperty("key", "value")` to add custom data to the MDC.
+
+## Structured Logging
+Starting with version 4.0.0, `spark-submit` supports optional structured logging using the [JSON Template Layout](https://logging.apache.org/log4j/2.x/manual/json-template-layout.html). This format enables efficient querying of logs with Spark SQL using the JSON data source and includes all MDC information for improved searchability and debugging.
+
+To enable structured logging and include MDC information, set the configuration `spark.log.structuredLogging.enabled` to `true` (default is `false`). For additional customization, copy `log4j2-json-layout.properties.template` to `conf/log4j2.properties` and adjust as needed.
+
+### Querying Structured Logs with Spark SQL
+To query structured logs in JSON format, use the following code snippet:
+
+**Python:**
+```python
+from pyspark.logger import SPARK_LOG_SCHEMA
+
+logDf = spark.read.schema(SPARK_LOG_SCHEMA).json("path/to/logs")
+```
+
+**Scala:**
+```scala
+import org.apache.spark.util.LogUtils.SPARK_LOG_SCHEMA
+
+val logDf = spark.read.schema(SPARK_LOG_SCHEMA).json("path/to/logs")
+```
+**Note**: If you're using the interactive shell (pyspark shell or spark-shell), you can omit the import statement in the code because SPARK_LOG_SCHEMA is already available in the shell's context.
 
 # Overriding configuration directory
 
@@ -3699,7 +3826,7 @@ Also, you can modify or add configurations at runtime:
 {% highlight bash %}
 ./bin/spark-submit \
   --name "My app" \
-  --master local[4] \
+  --master "local[4]" \
   --conf spark.eventLog.enabled=false \
   --conf "spark.executor.extraJavaOptions=-XX:+PrintGCDetails -XX:+PrintGCTimeStamps" \
   --conf spark.hadoop.abc.def=xyz \

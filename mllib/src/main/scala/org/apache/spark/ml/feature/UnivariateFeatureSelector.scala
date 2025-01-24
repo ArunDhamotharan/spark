@@ -289,6 +289,9 @@ class UnivariateFeatureSelectorModel private[ml](
   extends Model[UnivariateFeatureSelectorModel] with UnivariateFeatureSelectorParams
     with MLWritable {
 
+  private[ml] def this() = this(
+    Identifiable.randomUID("UnivariateFeatureSelector"), Array.emptyIntArray)
+
   /** @group setParam */
   @Since("3.1.1")
   def setFeaturesCol(value: String): this.type = set(featuresCol, value)
@@ -349,10 +352,10 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
     private case class Data(selectedFeatures: Seq[Int])
 
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       val data = Data(instance.selectedFeatures.toImmutableArraySeq)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      sparkSession.createDataFrame(Seq(data)).write.parquet(dataPath)
     }
   }
 
@@ -363,7 +366,7 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
     private val className = classOf[UnivariateFeatureSelectorModel].getName
 
     override def load(path: String): UnivariateFeatureSelectorModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
       val data = sparkSession.read.parquet(dataPath)
         .select("selectedFeatures").head()
@@ -410,7 +413,9 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
       featuresCol: String,
       isNumericAttribute: Boolean): StructField = {
     val selector = selectedFeatures.toSet
-    val origAttrGroup = AttributeGroup.fromStructField(schema(featuresCol))
+    val origAttrGroup = AttributeGroup.fromStructField(
+      SchemaUtils.getSchemaField(schema, featuresCol)
+    )
     val featureAttributes: Array[Attribute] = if (origAttrGroup.attributes.nonEmpty) {
       origAttrGroup.attributes.get.zipWithIndex.filter(x => selector.contains(x._2)).map(_._1)
     } else {

@@ -17,8 +17,9 @@
 
 package org.apache.spark.sql
 
-import org.apache.spark.{SparkConf, SparkException, SparkRuntimeException}
+import org.apache.spark.{SparkConf, SparkRuntimeException}
 import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.Cast.toSQLId
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.Project
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
@@ -60,6 +61,18 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
     }
   }
 
+  def assertLengthCheckFailure(query: String): Unit = {
+    assertLengthCheckFailure(() => sql(query))
+  }
+
+  def assertLengthCheckFailure(func: () => Unit): Unit = {
+    checkError(
+      exception = intercept[SparkRuntimeException](func()),
+      condition = "EXCEED_LIMIT_LENGTH",
+      parameters = Map("limit" -> "5")
+    )
+  }
+
   test("apply char padding/trimming and varchar trimming: top-level columns") {
     Seq("CHAR(5)", "VARCHAR(5)").foreach { typ =>
       withTable("t") {
@@ -70,6 +83,27 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
         }
         sql("INSERT OVERWRITE t VALUES ('1', null)")
         checkPlainResult(spark.table("t"), typ, null)
+      }
+    }
+  }
+
+  test("preserve char/varchar type info") {
+    Seq(CharType(5), VarcharType(5)).foreach { typ =>
+      for {
+        char_varchar_as_string <- Seq(false, true)
+        preserve_char_varchar <- Seq(false, true)
+      } {
+        withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> char_varchar_as_string.toString,
+          SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> preserve_char_varchar.toString) {
+          withTable("t") {
+            val name = typ.typeName
+            sql(s"CREATE TABLE t(i STRING, c $name) USING $format")
+            val schema = spark.table("t").schema
+            assert(schema.fields(0).dataType == StringType)
+            val expectedType = if (preserve_char_varchar) typ else StringType
+            assert(schema.fields(1).dataType == expectedType)
+          }
+        }
       }
     }
   }
@@ -147,28 +181,12 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       withTable("t") {
         sql(s"CREATE TABLE t(i STRING, c $typ) USING $format PARTITIONED BY (c)")
         Seq("ADD", "DROP").foreach { op =>
-          checkError(
-            exception = intercept[SparkRuntimeException] {
-              sql(s"ALTER TABLE t $op PARTITION(c='abcdef')")
-            },
-            errorClass = "EXCEED_LIMIT_LENGTH",
-            parameters = Map("limit" -> "5")
-          )
+          assertLengthCheckFailure(s"ALTER TABLE t $op PARTITION(c='abcdef')")
         }
-        checkError(
-          exception = intercept[SparkRuntimeException] {
-            sql(s"ALTER TABLE t PARTITION (c='abcdef') RENAME TO PARTITION (c='2')")
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
-        checkError(
-          exception = intercept[SparkRuntimeException] {
-            sql(s"ALTER TABLE t PARTITION (c='1') RENAME TO PARTITION (c='abcdef')")
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
+        assertLengthCheckFailure(
+          "ALTER TABLE t PARTITION (c='abcdef') RENAME TO PARTITION (c='2')")
+        assertLengthCheckFailure(
+          "ALTER TABLE t PARTITION (c='1') RENAME TO PARTITION (c='abcdef')")
       }
     }
   }
@@ -315,17 +333,7 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       sql(s"CREATE TABLE t(c $typeName(5)) USING $format")
       sql("INSERT INTO t VALUES (null)")
       checkAnswer(spark.table("t"), Row(null))
-      val ex = intercept[Exception] {
-        sql("INSERT INTO t VALUES ('123456')")
-      }
-      checkError(
-        exception = ex match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t VALUES ('123456')")
     }
   }
 
@@ -337,14 +345,7 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
         sql(s"CREATE TABLE $tableName(i INT, c $typeName(5)) USING $format PARTITIONED BY (c)")
         sql(s"INSERT INTO $tableName VALUES (1, null)")
         checkAnswer(spark.table(tableName), Row(1, null))
-        checkError(
-          exception = intercept[SparkException] {
-            sql(s"INSERT INTO $tableName VALUES (1, '123456')")
-          },
-          errorClass = "TASK_WRITE_FAILED",
-          parameters = Map("path" -> s".*$tableName.*"),
-          matchPVals = true
-        )
+        assertLengthCheckFailure(s"INSERT INTO $tableName VALUES (1, '123456')")
       }
     }
   }
@@ -354,13 +355,7 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       sql(s"CREATE TABLE t(c STRUCT<c: $typeName(5)>) USING $format")
       sql("INSERT INTO t SELECT struct(null)")
       checkAnswer(spark.table("t"), Row(Row(null)))
-      checkError(
-        exception = intercept[SparkRuntimeException] {
-          sql("INSERT INTO t SELECT struct('123456')")
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t SELECT struct('123456')")
     }
   }
 
@@ -369,32 +364,14 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       sql(s"CREATE TABLE t(c ARRAY<$typeName(5)>) USING $format")
       sql("INSERT INTO t VALUES (array(null))")
       checkAnswer(spark.table("t"), Row(Seq(null)))
-      val e = intercept[Exception] {
-        sql("INSERT INTO t VALUES (array('a', '123456'))")
-      }
-      checkError(
-        exception = e match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t VALUES (array('a', '123456'))")
     }
   }
 
   test("length check for input string values: nested in map key") {
     testTableWrite { typeName =>
       sql(s"CREATE TABLE t(c MAP<$typeName(5), STRING>) USING $format")
-      val e = intercept[Exception](sql("INSERT INTO t VALUES (map('123456', 'a'))"))
-      checkError(
-        exception = e match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t VALUES (map('123456', 'a'))")
     }
   }
 
@@ -403,39 +380,15 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       sql(s"CREATE TABLE t(c MAP<STRING, $typeName(5)>) USING $format")
       sql("INSERT INTO t VALUES (map('a', null))")
       checkAnswer(spark.table("t"), Row(Map("a" -> null)))
-      val e = intercept[Exception](sql("INSERT INTO t VALUES (map('a', '123456'))"))
-      checkError(
-        exception = e match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t VALUES (map('a', '123456'))")
     }
   }
 
   test("length check for input string values: nested in both map key and value") {
     testTableWrite { typeName =>
       sql(s"CREATE TABLE t(c MAP<$typeName(5), $typeName(5)>) USING $format")
-      val e1 = intercept[Exception](sql("INSERT INTO t VALUES (map('123456', 'a'))"))
-      checkError(
-        exception = e1 match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
-      val e2 = intercept[Exception](sql("INSERT INTO t VALUES (map('a', '123456'))"))
-      checkError(
-        exception = e2 match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t VALUES (map('123456', 'a'))")
+      assertLengthCheckFailure("INSERT INTO t VALUES (map('a', '123456'))")
     }
   }
 
@@ -444,15 +397,7 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       sql(s"CREATE TABLE t(c STRUCT<c: ARRAY<$typeName(5)>>) USING $format")
       sql("INSERT INTO t SELECT struct(array(null))")
       checkAnswer(spark.table("t"), Row(Row(Seq(null))))
-      val e = intercept[Exception](sql("INSERT INTO t SELECT struct(array('123456'))"))
-      checkError(
-        exception = e match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t SELECT struct(array('123456'))")
     }
   }
 
@@ -461,15 +406,7 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       sql(s"CREATE TABLE t(c ARRAY<STRUCT<c: $typeName(5)>>) USING $format")
       sql("INSERT INTO t VALUES (array(struct(null)))")
       checkAnswer(spark.table("t"), Row(Seq(Row(null))))
-      val e = intercept[Exception](sql("INSERT INTO t VALUES (array(struct('123456')))"))
-      checkError(
-        exception = e match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t VALUES (array(struct('123456')))")
     }
   }
 
@@ -478,15 +415,7 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       sql(s"CREATE TABLE t(c ARRAY<ARRAY<$typeName(5)>>) USING $format")
       sql("INSERT INTO t VALUES (array(array(null)))")
       checkAnswer(spark.table("t"), Row(Seq(Seq(null))))
-      val e = intercept[Exception](sql("INSERT INTO t VALUES (array(array('123456')))"))
-      checkError(
-        exception = e match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t VALUES (array(array('123456')))")
     }
   }
 
@@ -506,24 +435,8 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       sql(s"CREATE TABLE t(c1 CHAR(5), c2 VARCHAR(5)) USING $format")
       sql("INSERT INTO t VALUES (1234, 1234)")
       checkAnswer(spark.table("t"), Row("1234 ", "1234"))
-      val e1 = intercept[Exception](sql("INSERT INTO t VALUES (123456, 1)"))
-      checkError(
-        exception = e1 match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
-      val e2 = intercept[Exception](sql("INSERT INTO t VALUES (1, 123456)"))
-      checkError(
-        exception = e2 match {
-          case c: SparkRuntimeException => c
-          case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-        },
-        errorClass = "EXCEED_LIMIT_LENGTH",
-        parameters = Map("limit" -> "5")
-      )
+      assertLengthCheckFailure("INSERT INTO t VALUES (123456, 1)")
+      assertLengthCheckFailure("INSERT INTO t VALUES (1, 123456)")
     }
   }
 
@@ -770,6 +683,121 @@ trait CharVarcharTestSuite extends QueryTest with SQLTestUtils {
       }
     }
   }
+
+  test("SPARK-48792: Fix INSERT with partial column list to a table with char/varchar") {
+    assume(format != "foo",
+      "TODO: TableOutputResolver.resolveOutputColumns supportColDefaultValue is false")
+    Seq("char", "varchar").foreach { typ =>
+      withTable("students") {
+        sql(s"CREATE TABLE students (name $typ(64), address $typ(64)) USING $format")
+        sql("INSERT INTO students VALUES ('Kent Yao', 'Hangzhou')")
+        sql("INSERT INTO students (address) VALUES ('<unknown>')")
+        checkAnswer(sql("SELECT count(*) FROM students"), Row(2))
+      }
+    }
+  }
+
+  test(s"insert string literal into char/varchar column when " +
+    s"${SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key} is true") {
+    withSQLConf(SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> "true") {
+      withTable("t") {
+        sql(s"CREATE TABLE t(c1 CHAR(5), c2 VARCHAR(5)) USING $format")
+        sql("INSERT INTO t VALUES ('1234', '1234')")
+        checkAnswer(spark.table("t"), Row("1234 ", "1234"))
+        assertLengthCheckFailure("INSERT INTO t VALUES ('123456', '1')")
+        assertLengthCheckFailure("INSERT INTO t VALUES ('1', '123456')")
+      }
+    }
+  }
+
+  test(s"insert from string column into char/varchar column when " +
+    s"${SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key} is true") {
+    withSQLConf(SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> "true") {
+      withTable("a", "b") {
+        sql(s"CREATE TABLE a AS SELECT '1234' as c1, '1234' as c2")
+        sql(s"CREATE TABLE b(c1 CHAR(5), c2 VARCHAR(5)) USING $format")
+        sql("INSERT INTO b SELECT * FROM a")
+        checkAnswer(spark.table("b"), Row("1234 ", "1234"))
+        spark.table("b").show()
+      }
+    }
+  }
+
+  test(s"cast from char/varchar when ${SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key} is true") {
+    withSQLConf(SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> "true") {
+      Seq("char(5)", "varchar(5)").foreach { typ =>
+        Seq(
+          "int" -> ("123", 123),
+          "long" -> ("123 ", 123L),
+          "boolean" -> ("true ", true),
+          "boolean" -> ("false", false),
+          "double" -> ("1.2", 1.2)
+        ).foreach { case (toType, (from, to)) =>
+          assert(sql(s"select cast($from :: $typ as $toType)").collect() === Array(Row(to)))
+        }
+      }
+    }
+  }
+
+  test(s"cast to char/varchar when ${SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key} is true") {
+    withSQLConf(SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> "true") {
+      Seq("char(10)", "varchar(10)").foreach { typ =>
+        Seq(
+          123 -> "123",
+          123L-> "123",
+          true -> "true",
+          false -> "false",
+          1.2 -> "1.2"
+        ).foreach { case (from, to) =>
+          val paddedTo = if (typ == "char(10)") {
+            to.padTo(10, ' ')
+          } else {
+            to
+          }
+          sql(s"select cast($from as $typ)").collect() === Array(Row(paddedTo))
+        }
+      }
+    }
+  }
+
+  test("implicitly cast char/varchar into atomics") {
+    Seq("char", "varchar").foreach { typ =>
+      withSQLConf(SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> "true",
+        SQLConf.ANSI_ENABLED.key -> "true") {
+        checkAnswer(sql(
+          s"""
+             |SELECT
+             |NOT('false'::$typ(5)),
+             |1 + ('4'::$typ(5)),
+             |2L + ('4'::$typ(5)),
+             |3S + ('4'::$typ(5)),
+             |4Y - ('4'::$typ(5)),
+             |1.2 / ('0.6'::$typ(5)),
+             |MINUTE('2009-07-30 12:58:59'::$typ(30)),
+             |if(true, '0'::$typ(5), 1),
+             |if(false, '0'::$typ(5), 1)
+          """.stripMargin), Row(true, 5, 6, 7, 0, 2.0, 58, 0, 1))
+      }
+    }
+  }
+
+  test("SPARK-50847: Deny ApplyCharTypePadding from applying on specific In expressions") {
+    withTable("mytable") {
+      sql(s"CREATE TABLE mytable(col CHAR(10)) USING $format")
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("SELECT * FROM mytable where col IN (ARRAY('a'))")
+        },
+        condition = "DATATYPE_MISMATCH.DATA_DIFF_TYPES",
+        parameters = Map(
+          "functionName" -> toSQLId("in"),
+          "dataType" -> "[\"STRING\", \"ARRAY<STRING>\"]",
+          "sqlExpr" -> s""""(col IN (array(a)))""""
+        ),
+        queryContext = Array(ExpectedContext(fragment = "IN (ARRAY('a'))", start = 32, stop = 46))
+      )
+    }
+  }
 }
 
 // Some basic char/varchar tests which doesn't rely on table implementation.
@@ -798,7 +826,7 @@ class BasicCharVarcharTestSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         sql("""SELECT from_json('{"a": "str"}', 'a CHAR(5)')""")
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING",
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING",
       parameters = Map.empty,
       context = ExpectedContext(
         fragment = "from_json('{\"a\": \"str\"}', 'a CHAR(5)')",
@@ -820,19 +848,19 @@ class BasicCharVarcharTestSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         spark.createDataFrame(df.collectAsList(), schema)
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
     )
     checkError(
       exception = intercept[AnalysisException] {
         spark.createDataFrame(df.rdd, schema)
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
     )
     checkError(
       exception = intercept[AnalysisException] {
         spark.createDataFrame(df.toJavaRDD, schema)
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
     )
     withSQLConf((SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key, "true")) {
       val df1 = spark.createDataFrame(df.collectAsList(), schema)
@@ -846,12 +874,12 @@ class BasicCharVarcharTestSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         spark.read.schema(new StructType().add("id", CharType(5)))
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING")
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING")
     checkError(
       exception = intercept[AnalysisException] {
         spark.read.schema("id char(5)")
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
     )
     withSQLConf((SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key, "true")) {
       val ds = spark.range(10).map(_.toString)
@@ -888,13 +916,13 @@ class BasicCharVarcharTestSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         spark.udf.register("testchar", () => "B", VarcharType(1))
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
     )
     checkError(
       exception = intercept[AnalysisException] {
         spark.udf.register("testchar2", (x: String) => x, VarcharType(1))
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
     )
     withSQLConf((SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key, "true")) {
       spark.udf.register("testchar", () => "B", VarcharType(1))
@@ -913,13 +941,13 @@ class BasicCharVarcharTestSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         spark.readStream.schema(new StructType().add("id", CharType(5)))
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
     )
     checkError(
       exception = intercept[AnalysisException] {
         spark.readStream.schema("id char(5)")
       },
-      errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
+      condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING"
     )
     withSQLConf((SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key, "true")) {
       withTempPath { dir =>
@@ -941,7 +969,7 @@ class BasicCharVarcharTestSuite extends QueryTest with SharedSparkSession {
       val df = sql("SELECT * FROM t")
       checkError(exception = intercept[AnalysisException] {
         df.to(newSchema)
-      }, errorClass = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING", parameters = Map.empty)
+      }, condition = "UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING", parameters = Map.empty)
       withSQLConf((SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key, "true")) {
         val df1 = df.to(newSchema)
         checkAnswer(df1, df.select("v", "c"))
@@ -1046,23 +1074,56 @@ class FileSourceCharVarcharTestSuite extends CharVarcharTestSuite with SharedSpa
           sql(s"ALTER TABLE $tableName DROP PARTITION(c=$v)")
           checkAnswer(spark.table(tableName), Nil)
         }
+        assertLengthCheckFailure(s"INSERT OVERWRITE $tableName VALUES ('1', 100000)")
+        assertLengthCheckFailure("ALTER TABLE t DROP PARTITION(c=100000)")
+      }
+    }
+  }
 
-        checkError(
-          exception = intercept[SparkException] {
-            sql(s"INSERT OVERWRITE $tableName VALUES ('1', 100000)")
-          },
-          errorClass = "TASK_WRITE_FAILED",
-          parameters = Map("path" -> s".*$tableName"),
-          matchPVals = true
-        )
+  test("SPARK-48498: always do char padding in predicates") {
+    import testImplicits._
+    withSQLConf(SQLConf.READ_SIDE_CHAR_PADDING.key -> "false") {
+      withTempPath { dir =>
+        withTable("t1", "t2") {
+          Seq(
+            "12" -> "12",
+            "12" -> "12 ",
+            "12 " -> "12",
+            "12 " -> "12 "
+          ).toDF("c1", "c2").write.format(format).save(dir.toString)
 
-        checkError(
-          exception = intercept[SparkRuntimeException] {
-            sql("ALTER TABLE t DROP PARTITION(c=100000)")
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
+          sql(s"CREATE TABLE t1 (c1 CHAR(3), c2 STRING) USING $format LOCATION '$dir'")
+          // Comparing CHAR column with STRING column directly compares the stored value.
+          checkAnswer(
+            sql("SELECT c1 = c2 FROM t1"),
+            Seq(Row(true), Row(false), Row(false), Row(true))
+          )
+          checkAnswer(
+            sql("SELECT c1 IN (c2) FROM t1"),
+            Seq(Row(true), Row(false), Row(false), Row(true))
+          )
+          // No matter the CHAR type value is padded or not in the storage, we should always pad it
+          // before comparison with STRING literals.
+          checkAnswer(
+            sql("SELECT c1 = '12', c1 = '12 ', c1 = '12  ' FROM t1 WHERE c2 = '12'"),
+            Seq(Row(true, true, true), Row(true, true, true))
+          )
+          checkAnswer(
+            sql("SELECT c1 IN ('12'), c1 IN ('12 '), c1 IN ('12  ') FROM t1 WHERE c2 = '12'"),
+            Seq(Row(true, true, true), Row(true, true, true))
+          )
+
+          sql(s"CREATE TABLE t2 (c1 CHAR(3), c2 CHAR(5)) USING $format LOCATION '$dir'")
+          // Comparing CHAR column with CHAR column compares the padded values.
+          checkAnswer(
+            sql("SELECT c1 = c2, c2 = c1 FROM t2"),
+            Seq(Row(true, true), Row(true, true), Row(true, true), Row(true, true))
+          )
+          checkAnswer(
+            sql("SELECT c1 IN (c2), c2 IN (c1) FROM t2"),
+            Seq(Row(true, true), Row(true, true), Row(true, true), Row(true, true))
+          )
+        }
       }
     }
   }
@@ -1087,24 +1148,8 @@ class DSV2CharVarcharTestSuite extends CharVarcharTestSuite
           sql(s"ALTER TABLE t DROP PARTITION(c=$v)")
           checkAnswer(spark.table("t"), Nil)
         }
-
-        val e1 = intercept[Exception](sql(s"INSERT OVERWRITE t VALUES ('1', 100000)"))
-        checkError(
-          exception = e1 match {
-            case c: SparkRuntimeException => c
-            case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
-
-        checkError(
-          exception = intercept[SparkRuntimeException] {
-            sql("ALTER TABLE t DROP PARTITION(c=100000)")
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
+        assertLengthCheckFailure(s"INSERT OVERWRITE t VALUES ('1', 100000)")
+        assertLengthCheckFailure("ALTER TABLE t DROP PARTITION(c=100000)")
       }
     }
   }
@@ -1113,16 +1158,8 @@ class DSV2CharVarcharTestSuite extends CharVarcharTestSuite
     Seq("CHAR(5)", "VARCHAR(5)").foreach { typ =>
       withTable("t") {
         sql(s"CREATE TABLE t(s STRUCT<n_c: $typ, n_i: INT>) USING $format")
-
         val inputDF = sql("SELECT named_struct('n_i', 1, 'n_c', '123456') AS s")
-
-        checkError(
-          exception = intercept[SparkRuntimeException] {
-            inputDF.writeTo("t").append()
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
+        assertLengthCheckFailure(() => inputDF.writeTo("t").append())
       }
     }
   }
@@ -1131,18 +1168,8 @@ class DSV2CharVarcharTestSuite extends CharVarcharTestSuite
     Seq("CHAR(5)", "VARCHAR(5)").foreach { typ =>
       withTable("t") {
         sql(s"CREATE TABLE t(a ARRAY<STRUCT<n_c: $typ, n_i: INT>>) USING $format")
-
         val inputDF = sql("SELECT array(named_struct('n_i', 1, 'n_c', '123456')) AS a")
-
-        val e = intercept[Exception](inputDF.writeTo("t").append())
-        checkError(
-          exception = e match {
-            case c: SparkRuntimeException => c
-            case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
+        assertLengthCheckFailure(() => inputDF.writeTo("t").append())
       }
     }
   }
@@ -1151,18 +1178,8 @@ class DSV2CharVarcharTestSuite extends CharVarcharTestSuite
     Seq("CHAR(5)", "VARCHAR(5)").foreach { typ =>
       withTable("t") {
         sql(s"CREATE TABLE t(m MAP<STRUCT<n_c: $typ, n_i: INT>, INT>) USING $format")
-
         val inputDF = sql("SELECT map(named_struct('n_i', 1, 'n_c', '123456'), 1) AS m")
-
-        val e = intercept[Exception](inputDF.writeTo("t").append())
-        checkError(
-          exception = e match {
-            case c: SparkRuntimeException => c
-            case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
+        assertLengthCheckFailure(() => inputDF.writeTo("t").append())
       }
     }
   }
@@ -1171,18 +1188,8 @@ class DSV2CharVarcharTestSuite extends CharVarcharTestSuite
     Seq("CHAR(5)", "VARCHAR(5)").foreach { typ =>
       withTable("t") {
         sql(s"CREATE TABLE t(m MAP<INT, STRUCT<n_c: $typ, n_i: INT>>) USING $format")
-
         val inputDF = sql("SELECT map(1, named_struct('n_i', 1, 'n_c', '123456')) AS m")
-
-        val e = intercept[Exception](inputDF.writeTo("t").append())
-        checkError(
-          exception = e match {
-            case c: SparkRuntimeException => c
-            case c: SparkException => c.getCause.asInstanceOf[SparkRuntimeException]
-          },
-          errorClass = "EXCEED_LIMIT_LENGTH",
-          parameters = Map("limit" -> "5")
-        )
+        assertLengthCheckFailure(() => inputDF.writeTo("t").append())
       }
     }
   }

@@ -53,8 +53,6 @@ import org.apache.spark.sql.types._
  * - [[Unevaluable]]: an expression that is not supposed to be evaluated.
  * - [[CodegenFallback]]: an expression that does not have code gen implemented and falls back to
  *                        interpreted mode.
- * - [[NullIntolerant]]: an expression that is null intolerant (i.e. any null input will result in
- *                       null output).
  * - [[NonSQLExpression]]: a common base trait for the expressions that do not have SQL
  *                         expressions like representation. For example, `ScalaUDF`, `ScalaUDAF`,
  *                         and object `MapObjects` and `Invoke`.
@@ -140,6 +138,14 @@ abstract class Expression extends TreeNode[Expression] {
    * }}}
    */
   def stateful: Boolean = false
+
+
+  /**
+   * When an expression inherits this, meaning the expression is null intolerant (i.e. any null
+   * input will result in null output). We will use this information during constructing IsNotNull
+   * constraints.
+   */
+  def nullIntolerant: Boolean = false
 
   /**
    * Returns true if the expression could potentially throw an exception when evaluated.
@@ -376,24 +382,33 @@ abstract class Expression extends TreeNode[Expression] {
     }
 }
 
+/**
+ * An expression that cannot be evaluated but is guaranteed to be replaced with a foldable value
+ * by query optimizer (e.g. CurrentDate).
+ */
+trait FoldableUnevaluable extends Expression {
+  override def foldable: Boolean = true
+
+  override def eval(input: InternalRow = null): Any =
+    throw QueryExecutionErrors.cannotEvaluateExpressionError(this)
+
+  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode =
+    throw QueryExecutionErrors.cannotGenerateCodeForExpressionError(this)
+}
 
 /**
  * An expression that cannot be evaluated. These expressions don't live past analysis or
  * optimization time (e.g. Star) and should not be evaluated during query planning and
  * execution.
  */
-trait Unevaluable extends Expression {
+trait Unevaluable extends Expression with FoldableUnevaluable {
 
-  /** Unevaluable is not foldable because we don't have an eval for it. */
+  /** Unevaluable is not foldable by default because we don't have an eval for it.
+   * Exception are expressions that will be replaced by a literal by Optimizer (e.g. CurrentDate).
+   * Hence we allow overriding overriding of this field in special cases.
+   */
   final override def foldable: Boolean = false
-
-  final override def eval(input: InternalRow = null): Any =
-    throw QueryExecutionErrors.cannotEvaluateExpressionError(this)
-
-  final override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode =
-    throw QueryExecutionErrors.cannotGenerateCodeForExpressionError(this)
 }
-
 
 /**
  * An expression that gets replaced at runtime (currently by the optimizer) into a different
@@ -411,8 +426,12 @@ trait RuntimeReplaceable extends Expression {
   // are semantically equal.
   override lazy val canonicalized: Expression = replacement.canonicalized
 
-  final override def eval(input: InternalRow = null): Any =
-    throw QueryExecutionErrors.cannotEvaluateExpressionError(this)
+  final override def eval(input: InternalRow = null): Any = {
+    // For convenience, we allow to evaluate `RuntimeReplaceable` expressions, in case we need to
+    // get a constant from foldable expression before the query execution starts.
+    assert(input == null)
+    replacement.eval()
+  }
   final override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode =
     throw QueryExecutionErrors.cannotGenerateCodeForExpressionError(this)
 }
@@ -565,7 +584,7 @@ abstract class UnaryExpression extends Expression with UnaryLike[Expression] {
    * of evaluation process, we should override [[eval]].
    */
   protected def nullSafeEval(input: Any): Any =
-    throw QueryExecutionErrors.notOverrideExpectedMethodsError("UnaryExpressions",
+    throw QueryExecutionErrors.notOverrideExpectedMethodsError(this.getClass.getName,
       "eval", "nullSafeEval")
 
   /**
@@ -691,7 +710,7 @@ abstract class BinaryExpression extends Expression with BinaryLike[Expression] {
    * of evaluation process, we should override [[eval]].
    */
   protected def nullSafeEval(input1: Any, input2: Any): Any =
-    throw QueryExecutionErrors.notOverrideExpectedMethodsError("BinaryExpressions",
+    throw QueryExecutionErrors.notOverrideExpectedMethodsError(this.getClass.getName,
       "eval", "nullSafeEval")
 
   /**
@@ -842,7 +861,7 @@ abstract class TernaryExpression extends Expression with TernaryLike[Expression]
    * of evaluation process, we should override [[eval]].
    */
   protected def nullSafeEval(input1: Any, input2: Any, input3: Any): Any =
-    throw QueryExecutionErrors.notOverrideExpectedMethodsError("TernaryExpressions",
+    throw QueryExecutionErrors.notOverrideExpectedMethodsError(this.getClass.getName,
       "eval", "nullSafeEval")
 
   /**
@@ -943,7 +962,7 @@ abstract class QuaternaryExpression extends Expression with QuaternaryLike[Expre
    *  full control of evaluation process, we should override [[eval]].
    */
   protected def nullSafeEval(input1: Any, input2: Any, input3: Any, input4: Any): Any =
-    throw QueryExecutionErrors.notOverrideExpectedMethodsError("QuaternaryExpressions",
+    throw QueryExecutionErrors.notOverrideExpectedMethodsError(this.getClass.getName,
       "eval", "nullSafeEval")
 
   /**
@@ -1058,7 +1077,7 @@ abstract class QuinaryExpression extends Expression {
       input4: Any,
       input5: Any): Any = {
     throw QueryExecutionErrors.notOverrideExpectedMethodsError(
-      "QuinaryExpression",
+      this.getClass.getName,
       "eval",
       "nullSafeEval")
   }
@@ -1196,7 +1215,7 @@ abstract class SeptenaryExpression extends Expression {
       input5: Any,
       input6: Any,
       input7: Option[Any]): Any = {
-    throw QueryExecutionErrors.notOverrideExpectedMethodsError("SeptenaryExpression",
+    throw QueryExecutionErrors.notOverrideExpectedMethodsError(this.getClass.getName,
       "eval", "nullSafeEval")
   }
 
@@ -1335,12 +1354,29 @@ trait UserDefinedExpression {
 }
 
 trait CommutativeExpression extends Expression {
-  /** Collects adjacent commutative operations. */
-  private def gatherCommutative(
+  /**
+   * Collects adjacent commutative operations.
+   *
+   * Exposed for testing
+   */
+  private[spark] def gatherCommutative(
       e: Expression,
-      f: PartialFunction[CommutativeExpression, Seq[Expression]]): Seq[Expression] = e match {
-    case c: CommutativeExpression if f.isDefinedAt(c) => f(c).flatMap(gatherCommutative(_, f))
-    case other => other.canonicalized :: Nil
+      f: PartialFunction[CommutativeExpression, Seq[Expression]]): Seq[Expression] = {
+    val resultBuffer = scala.collection.mutable.Buffer[Expression]()
+    val queue = scala.collection.mutable.Queue[Expression](e)
+
+    // [SPARK-49977]: Use iterative approach to avoid creating many temporary List objects
+    // for deep expression trees through recursion.
+    while (queue.nonEmpty) {
+      val current = queue.dequeue()
+      current match {
+        case c: CommutativeExpression if f.isDefinedAt(c) =>
+          queue ++= f(c)
+        case other =>
+          resultBuffer += other.canonicalized
+      }
+    }
+    resultBuffer.toSeq
   }
 
   /**
@@ -1425,4 +1461,11 @@ case class MultiCommutativeOp(
     this.copy(operands = newChildren)(originalRoot)
 
   override protected final def otherCopyArgs: Seq[AnyRef] = originalRoot :: Nil
+}
+
+/**
+ * Trait for expressions whose data type should be a default string type.
+ */
+trait DefaultStringProducingExpression extends Expression {
+  override def dataType: DataType = SQLConf.get.defaultStringType
 }

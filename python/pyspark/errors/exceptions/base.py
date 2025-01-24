@@ -14,11 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import warnings
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, Optional, cast, Iterable, TYPE_CHECKING, List
 
 from pyspark.errors.utils import ErrorClassesReader
+from pyspark.logger import PySparkLogger
 from pickle import PicklingError
 
 if TYPE_CHECKING:
@@ -33,30 +35,30 @@ class PySparkException(Exception):
     def __init__(
         self,
         message: Optional[str] = None,
-        error_class: Optional[str] = None,
-        message_parameters: Optional[Dict[str, str]] = None,
-        query_contexts: Optional[List["QueryContext"]] = None,
+        errorClass: Optional[str] = None,
+        messageParameters: Optional[Dict[str, str]] = None,
+        contexts: Optional[List["QueryContext"]] = None,
     ):
-        if query_contexts is None:
-            query_contexts = []
+        if contexts is None:
+            contexts = []
         self._error_reader = ErrorClassesReader()
 
         if message is None:
             self._message = self._error_reader.get_error_message(
-                cast(str, error_class), cast(Dict[str, str], message_parameters)
+                cast(str, errorClass), cast(Dict[str, str], messageParameters)
             )
         else:
             self._message = message
 
-        self._error_class = error_class
-        self._message_parameters = message_parameters
-        self._query_contexts = query_contexts
+        self._errorClass = errorClass
+        self._messageParameters = messageParameters
+        self._contexts = contexts
 
-    def getErrorClass(self) -> Optional[str]:
+    def getCondition(self) -> Optional[str]:
         """
-        Returns an error class as a string.
+        Returns an error condition.
 
-        .. versionadded:: 3.4.0
+        .. versionadded:: 4.0.0
 
         See Also
         --------
@@ -65,7 +67,25 @@ class PySparkException(Exception):
         :meth:`PySparkException.getQueryContext`
         :meth:`PySparkException.getSqlState`
         """
-        return self._error_class
+        return self._errorClass
+
+    def getErrorClass(self) -> Optional[str]:
+        """
+        Returns an error class as a string.
+
+        .. versionadded:: 3.4.0
+
+        .. deprecated:: 4.0.0
+
+        See Also
+        --------
+        :meth:`PySparkException.getMessage`
+        :meth:`PySparkException.getMessageParameters`
+        :meth:`PySparkException.getQueryContext`
+        :meth:`PySparkException.getSqlState`
+        """
+        warnings.warn("Deprecated in 4.0.0, use getCondition instead.", FutureWarning)
+        return self.getCondition()
 
     def getMessageParameters(self) -> Optional[Dict[str, str]]:
         """
@@ -75,12 +95,12 @@ class PySparkException(Exception):
 
         See Also
         --------
-        :meth:`PySparkException.getErrorClass`
+        :meth:`PySparkException.getCondition`
         :meth:`PySparkException.getMessage`
         :meth:`PySparkException.getQueryContext`
         :meth:`PySparkException.getSqlState`
         """
-        return self._message_parameters
+        return self._messageParameters
 
     def getSqlState(self) -> Optional[str]:
         """
@@ -92,7 +112,7 @@ class PySparkException(Exception):
 
         See Also
         --------
-        :meth:`PySparkException.getErrorClass`
+        :meth:`PySparkException.getCondition`
         :meth:`PySparkException.getMessage`
         :meth:`PySparkException.getMessageParameters`
         :meth:`PySparkException.getQueryContext`
@@ -107,12 +127,12 @@ class PySparkException(Exception):
 
         See Also
         --------
-        :meth:`PySparkException.getErrorClass`
+        :meth:`PySparkException.getCondition`
         :meth:`PySparkException.getMessageParameters`
         :meth:`PySparkException.getQueryContext`
         :meth:`PySparkException.getSqlState`
         """
-        return f"[{self.getErrorClass()}] {self._message}"
+        return f"[{self.getCondition()}] {self._message}"
 
     def getQueryContext(self) -> List["QueryContext"]:
         """
@@ -122,15 +142,37 @@ class PySparkException(Exception):
 
         See Also
         --------
-        :meth:`PySparkException.getErrorClass`
+        :meth:`PySparkException.getCondition`
         :meth:`PySparkException.getMessageParameters`
         :meth:`PySparkException.getMessage`
         :meth:`PySparkException.getSqlState`
         """
-        return self._query_contexts
+        return self._contexts
+
+    def _log_exception(self) -> None:
+        contexts = self.getQueryContext()
+        context = contexts[0] if len(contexts) != 0 else None
+        if context:
+            if context.contextType().name == "DataFrame":
+                logger = PySparkLogger.getLogger("DataFrameQueryContextLogger")
+                call_site = context.callSite().split(":")
+                line = call_site[1] if len(call_site) == 2 else ""
+                logger.exception(
+                    self.getMessage(),
+                    file=call_site[0],
+                    line=line,
+                    fragment=context.fragment(),
+                    errorClass=self.getCondition(),
+                )
+            else:
+                logger = PySparkLogger.getLogger("SQLQueryContextLogger")
+                logger.exception(
+                    self.getMessage(),
+                    errorClass=self.getCondition(),
+                )
 
     def __str__(self) -> str:
-        if self.getErrorClass() is not None:
+        if self.getCondition() is not None:
             return self.getMessage()
         else:
             return self._message
@@ -276,11 +318,11 @@ class PySparkAssertionError(PySparkException, AssertionError):
     def __init__(
         self,
         message: Optional[str] = None,
-        error_class: Optional[str] = None,
-        message_parameters: Optional[Dict[str, str]] = None,
+        errorClass: Optional[str] = None,
+        messageParameters: Optional[Dict[str, str]] = None,
         data: Optional[Iterable["Row"]] = None,
     ):
-        super().__init__(message, error_class, message_parameters)
+        super().__init__(message, errorClass, messageParameters)
         self.data = data
 
 

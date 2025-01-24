@@ -24,17 +24,14 @@ import com.google.common.io.Files
 import io.fabric8.kubernetes.client.{ConfigBuilder, KubernetesClient, KubernetesClientBuilder}
 import io.fabric8.kubernetes.client.Config.KUBERNETES_REQUEST_RETRY_BACKOFFLIMIT_SYSTEM_PROPERTY
 import io.fabric8.kubernetes.client.Config.autoConfigure
-import io.fabric8.kubernetes.client.okhttp.OkHttpClientFactory
 import io.fabric8.kubernetes.client.utils.Utils.getSystemPropertyOrEnvVar
-import okhttp3.Dispatcher
-import okhttp3.OkHttpClient
 
 import org.apache.spark.SparkConf
 import org.apache.spark.annotation.{DeveloperApi, Since, Stable}
 import org.apache.spark.deploy.k8s.Config._
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.K8S_CONTEXT
 import org.apache.spark.internal.config.ConfigEntry
-import org.apache.spark.util.ThreadUtils
 
 /**
  * :: DeveloperApi ::
@@ -77,16 +74,12 @@ object SparkKubernetesClientFactory extends Logging {
       .getOption(s"$kubernetesAuthConfPrefix.$CLIENT_KEY_FILE_CONF_SUFFIX")
     val clientCertFile = sparkConf
       .getOption(s"$kubernetesAuthConfPrefix.$CLIENT_CERT_FILE_CONF_SUFFIX")
-    // TODO(SPARK-37687): clean up direct usage of OkHttpClient, see also:
-    // https://github.com/fabric8io/kubernetes-client/issues/3547
-    val dispatcher = new Dispatcher(
-      ThreadUtils.newDaemonCachedThreadPool("kubernetes-dispatcher"))
 
     // Allow for specifying a context used to auto-configure from the users K8S config file
     val kubeContext = sparkConf.get(KUBERNETES_CONTEXT).filter(_.nonEmpty)
-    logInfo("Auto-configuring K8S client using " +
-      kubeContext.map("context " + _).getOrElse("current context") +
-      " from users K8S config file")
+    logInfo(log"Auto-configuring K8S client using " +
+      log"${MDC(K8S_CONTEXT, kubeContext.map("context " + _).getOrElse("current context"))}" +
+      log" from users K8S config file")
 
     // if backoff limit is not set then set it to 3
     if (getSystemPropertyOrEnvVar(KUBERNETES_REQUEST_RETRY_BACKOFFLIMIT_SYSTEM_PROPERTY) == null) {
@@ -106,7 +99,7 @@ object SparkKubernetesClientFactory extends Logging {
         (token, configBuilder) => configBuilder.withOauthToken(token)
       }.withOption(oauthTokenFile) {
         (file, configBuilder) =>
-            configBuilder.withOauthToken(Files.toString(file, Charsets.UTF_8))
+            configBuilder.withOauthToken(Files.asCharSource(file, Charsets.UTF_8).read())
       }.withOption(caCertFile) {
         (file, configBuilder) => configBuilder.withCaCertFile(file)
       }.withOption(clientKeyFile) {
@@ -116,17 +109,9 @@ object SparkKubernetesClientFactory extends Logging {
       }.withOption(namespace) {
         (ns, configBuilder) => configBuilder.withNamespace(ns)
       }.build()
-    val factoryWithCustomDispatcher = new OkHttpClientFactory() {
-      override protected def additionalConfig(builder: OkHttpClient.Builder): Unit = {
-        builder.dispatcher(dispatcher)
-      }
-    }
     logDebug("Kubernetes client config: " +
       new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(config))
-    new KubernetesClientBuilder()
-      .withHttpClientFactory(factoryWithCustomDispatcher)
-      .withConfig(config)
-      .build()
+    new KubernetesClientBuilder().withConfig(config).build()
   }
 
   private implicit class OptionConfigurableConfigBuilder(val configBuilder: ConfigBuilder)

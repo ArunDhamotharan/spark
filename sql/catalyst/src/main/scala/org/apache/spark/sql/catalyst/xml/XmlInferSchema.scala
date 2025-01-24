@@ -30,6 +30,9 @@ import scala.util.control.Exception._
 import scala.util.control.NonFatal
 import scala.xml.SAXException
 
+import org.apache.hadoop.hdfs.BlockMissingException
+import org.apache.hadoop.security.AccessControlException
+
 import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
@@ -37,7 +40,6 @@ import org.apache.spark.sql.catalyst.analysis.TypeCoercion
 import org.apache.spark.sql.catalyst.expressions.ExprUtils
 import org.apache.spark.sql.catalyst.util.{DateFormatter, DropMalformedMode, FailFastMode, ParseMode, PermissiveMode, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.LegacyDateFormats.FAST_DATE_FORMAT
-import org.apache.spark.sql.catalyst.xml.XmlInferSchema.compatibleType
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 import org.apache.spark.sql.types._
@@ -45,6 +47,8 @@ import org.apache.spark.sql.types._
 class XmlInferSchema(options: XmlOptions, caseSensitive: Boolean)
     extends Serializable
     with Logging {
+
+  import org.apache.spark.sql.catalyst.xml.XmlInferSchema._
 
   private val decimalParser = ExprUtils.getDecimalParser(options.locale)
 
@@ -78,7 +82,8 @@ class XmlInferSchema(options: XmlOptions, caseSensitive: Boolean)
       case DropMalformedMode =>
         None
       case FailFastMode =>
-        throw QueryExecutionErrors.malformedRecordsDetectedInSchemaInferenceError(e)
+        throw QueryExecutionErrors.malformedRecordsDetectedInSchemaInferenceError(
+          e, columnNameOfCorruptRecord)
     }
   }
 
@@ -120,6 +125,7 @@ class XmlInferSchema(options: XmlOptions, caseSensitive: Boolean)
       case Some(st: StructType) => st
       case _ =>
         // canonicalizeType erases all empty structs, including the only one we want to keep
+        // XML shouldn't run into this line
         StructType(Seq())
     }
   }
@@ -154,6 +160,7 @@ class XmlInferSchema(options: XmlOptions, caseSensitive: Boolean)
         logWarning("Skipped missing file", e)
         Some(StructType(Nil))
       case e: FileNotFoundException if !options.ignoreMissingFiles => throw e
+      case e @ (_ : AccessControlException | _ : BlockMissingException) => throw e
       case e @ (_: IOException | _: RuntimeException) if options.ignoreCorruptFiles =>
         logWarning("Skipped the rest of the content in the corrupted file", e)
         Some(StructType(Nil))
@@ -195,7 +202,9 @@ class XmlInferSchema(options: XmlOptions, caseSensitive: Boolean)
 
   private def inferField(parser: XMLEventReader): DataType = {
     parser.peek match {
-      case _: EndElement => NullType
+      case _: EndElement =>
+        parser.nextEvent()
+        NullType
       case _: StartElement => inferObject(parser)
       case _: Characters =>
         val structType = inferObject(parser).asInstanceOf[StructType]
@@ -450,7 +459,7 @@ class XmlInferSchema(options: XmlOptions, caseSensitive: Boolean)
     oldTypeOpt match {
       // If the field name already exists,
       // merge the type and infer the combined field as an array type if necessary
-      case Some(oldType) if !oldType.isInstanceOf[ArrayType] && !newType.isInstanceOf[NullType] =>
+      case Some(oldType) if !oldType.isInstanceOf[ArrayType] =>
         ArrayType(compatibleType(caseSensitive, options.valueTag)(oldType, newType))
       case Some(oldType) =>
         compatibleType(caseSensitive, options.valueTag)(oldType, newType)
@@ -539,6 +548,10 @@ object XmlInferSchema {
         // As this library can infer an element with attributes as StructType whereas
         // some can be inferred as other non-structural data types, this case should be
         // treated.
+        // 1. Without value tags, combining structs and primitive types defaults to string type
+        // 2. With value tags, combining structs and primitive types defaults to
+        //    a struct with value tags of compatible type
+        // This behavior keeps aligned with JSON
         case (st: StructType, dt: DataType) if st.fieldNames.contains(valueTag) =>
           val valueIndex = st.fieldNames.indexOf(valueTag)
           val valueField = st.fields(valueIndex)

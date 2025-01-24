@@ -31,8 +31,9 @@ import scala.util.control.NonFatal
 
 import org.apache.spark._
 import org.apache.spark.api.python.PythonFunction.PythonAccumulator
-import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.{BUFFER_SIZE, EXECUTOR_CORES, Python}
+import org.apache.spark.internal.{Logging, LogKeys, MDC}
+import org.apache.spark.internal.LogKeys.TASK_NAME
+import org.apache.spark.internal.config.{BUFFER_SIZE, EXECUTOR_CORES}
 import org.apache.spark.internal.config.Python._
 import org.apache.spark.rdd.InputFileBlockHolder
 import org.apache.spark.resource.ResourceProfile.{EXECUTOR_CORES_LOCAL_PROPERTY, PYSPARK_MEMORY_LOCAL_PROPERTY}
@@ -60,6 +61,8 @@ private[spark] object PythonEvalType {
   val SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE = 208
   val SQL_GROUPED_MAP_ARROW_UDF = 209
   val SQL_COGROUPED_MAP_ARROW_UDF = 210
+  val SQL_TRANSFORM_WITH_STATE_PANDAS_UDF = 211
+  val SQL_TRANSFORM_WITH_STATE_PANDAS_INIT_STATE_UDF = 212
 
   val SQL_TABLE_UDF = 300
   val SQL_ARROW_TABLE_UDF = 301
@@ -81,14 +84,17 @@ private[spark] object PythonEvalType {
     case SQL_COGROUPED_MAP_ARROW_UDF => "SQL_COGROUPED_MAP_ARROW_UDF"
     case SQL_TABLE_UDF => "SQL_TABLE_UDF"
     case SQL_ARROW_TABLE_UDF => "SQL_ARROW_TABLE_UDF"
+    case SQL_TRANSFORM_WITH_STATE_PANDAS_UDF => "SQL_TRANSFORM_WITH_STATE_PANDAS_UDF"
+    case SQL_TRANSFORM_WITH_STATE_PANDAS_INIT_STATE_UDF =>
+      "SQL_TRANSFORM_WITH_STATE_PANDAS_INIT_STATE_UDF"
   }
 }
 
-private object BasePythonRunner {
+private[spark] object BasePythonRunner {
 
-  private lazy val faultHandlerLogDir = Utils.createTempDir(namePrefix = "faulthandler")
+  private[spark] lazy val faultHandlerLogDir = Utils.createTempDir(namePrefix = "faulthandler")
 
-  private def faultHandlerLogPath(pid: Long): Path = {
+  private[spark] def faultHandlerLogPath(pid: Int): Path = {
     new File(faultHandlerLogDir, pid.toString).toPath
   }
 }
@@ -103,7 +109,8 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     protected val funcs: Seq[ChainedPythonFunctions],
     protected val evalType: Int,
     protected val argOffsets: Array[Array[Int]],
-    protected val jobArtifactUUID: Option[String])
+    protected val jobArtifactUUID: Option[String],
+    protected val metrics: Map[String, AccumulatorV2[Long, Long]])
   extends Logging {
 
   require(funcs.length == argOffsets.length, "argOffsets should have the same length as funcs")
@@ -122,6 +129,8 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
   protected val pythonExec: String = funcs.head.funcs.head.pythonExec
   protected val pythonVer: String = funcs.head.funcs.head.pythonVer
 
+  protected val batchSizeForPythonUDF: Int = 100
+
   // WARN: Both configurations, 'spark.python.daemon.module' and 'spark.python.worker.module' are
   // for very advanced users and they are experimental. This should be considered
   // as expert-only option, and shouldn't be used before knowing what it means exactly.
@@ -130,9 +139,11 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
   private val daemonModule =
     conf.get(PYTHON_DAEMON_MODULE).map { value =>
       logInfo(
-        s"Python daemon module in PySpark is set to [$value] in '${PYTHON_DAEMON_MODULE.key}', " +
-        "using this to start the daemon up. Note that this configuration only has an effect when " +
-        s"'${PYTHON_USE_DAEMON.key}' is enabled and the platform is not Windows.")
+        log"Python daemon module in PySpark is set to " +
+        log"[${MDC(LogKeys.VALUE, value)}] in '${MDC(LogKeys.CONFIG,
+          PYTHON_DAEMON_MODULE.key)}', using this to start the daemon up. Note that this " +
+          log"configuration only has an effect when '${MDC(LogKeys.CONFIG2,
+            PYTHON_USE_DAEMON.key)}' is enabled and the platform is not Windows.")
       value
     }.getOrElse("pyspark.daemon")
 
@@ -140,9 +151,11 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
   private val workerModule =
     conf.get(PYTHON_WORKER_MODULE).map { value =>
       logInfo(
-        s"Python worker module in PySpark is set to [$value] in '${PYTHON_WORKER_MODULE.key}', " +
-        "using this to start the worker up. Note that this configuration only has an effect when " +
-        s"'${PYTHON_USE_DAEMON.key}' is disabled or the platform is Windows.")
+        log"Python worker module in PySpark is set to ${MDC(LogKeys.VALUE, value)} " +
+        log"in ${MDC(LogKeys.CONFIG, PYTHON_WORKER_MODULE.key)}, " +
+        log"using this to start the worker up. Note that this configuration only has " +
+        log"an effect when ${MDC(LogKeys.CONFIG2, PYTHON_USE_DAEMON.key)} " +
+        log"is disabled or the platform is Windows.")
       value
     }.getOrElse("pyspark.worker")
 
@@ -201,10 +214,12 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     if (faultHandlerEnabled) {
       envVars.put("PYTHON_FAULTHANDLER_DIR", BasePythonRunner.faultHandlerLogDir.toString)
     }
+    // allow the user to set the batch size for the BatchedSerializer on UDFs
+    envVars.put("PYTHON_UDF_BATCH_SIZE", batchSizeForPythonUDF.toString)
 
     envVars.put("SPARK_JOB_ARTIFACT_UUID", jobArtifactUUID.getOrElse("default"))
 
-    val (worker: PythonWorker, pid: Option[Long]) = env.createPythonWorker(
+    val (worker: PythonWorker, pid: Option[Int]) = env.createPythonWorker(
       pythonExec, workerModule, daemonModule, envVars.asScala.toMap)
     // Whether is the worker released into idle pool or closed. When any codes try to release or
     // close a worker, they should use `releasedOrClosed.compareAndSet` to flip the state to make
@@ -257,7 +272,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
       startTime: Long,
       env: SparkEnv,
       worker: PythonWorker,
-      pid: Option[Long],
+      pid: Option[Int],
       releasedOrClosed: AtomicBoolean,
       context: TaskContext): Iterator[OUT]
 
@@ -465,7 +480,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
       startTime: Long,
       env: SparkEnv,
       worker: PythonWorker,
-      pid: Option[Long],
+      pid: Option[Int],
       releasedOrClosed: AtomicBoolean,
       context: TaskContext)
     extends Iterator[OUT] {
@@ -508,8 +523,13 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
       val init = initTime - bootTime
       val finish = finishTime - initTime
       val total = finishTime - startTime
-      logInfo("Times: total = %s, boot = %s, init = %s, finish = %s".format(total, boot,
-        init, finish))
+      logInfo(log"Times: total = ${MDC(LogKeys.TOTAL_TIME, total)}, " +
+        log"boot = ${MDC(LogKeys.BOOT_TIME, boot)}, " +
+        log"init = ${MDC(LogKeys.INIT_TIME, init)}, " +
+        log"finish = ${MDC(LogKeys.FINISH_TIME, finish)}")
+      metrics.get("pythonBootTime").foreach(_.add(boot))
+      metrics.get("pythonInitTime").foreach(_.add(init))
+      metrics.get("pythonTotalTime").foreach(_.add(total))
       val memoryBytesSpilled = stream.readLong()
       val diskBytesSpilled = stream.readLong()
       context.taskMetrics().incMemoryBytesSpilled(memoryBytesSpilled)
@@ -554,15 +574,15 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
         JavaFiles.deleteIfExists(path)
         throw new SparkException(s"Python worker exited unexpectedly (crashed): $error", e)
 
-      case eof: EOFException if !faultHandlerEnabled =>
+      case e: IOException if !faultHandlerEnabled =>
         throw new SparkException(
           s"Python worker exited unexpectedly (crashed). " +
             "Consider setting 'spark.sql.execution.pyspark.udf.faulthandler.enabled' or" +
-            s"'${Python.PYTHON_WORKER_FAULTHANLDER_ENABLED.key}' configuration to 'true' for" +
-            "the better Python traceback.", eof)
+            s"'${PYTHON_WORKER_FAULTHANLDER_ENABLED.key}' configuration to 'true' for " +
+            "the better Python traceback.", e)
 
-      case eof: EOFException =>
-        throw new SparkException("Python worker exited unexpectedly (crashed)", eof)
+      case e: IOException =>
+        throw new SparkException("Python worker exited unexpectedly (crashed)", e)
     }
   }
 
@@ -592,7 +612,8 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
             // Mimic the task name used in `Executor` to help the user find out the task to blame.
             val taskName = s"${context.partitionId()}.${context.attemptNumber()} " +
               s"in stage ${context.stageId()} (TID ${context.taskAttemptId()})"
-            logWarning(s"Incomplete task $taskName interrupted: Attempting to kill Python Worker")
+            logWarning(log"Incomplete task ${MDC(TASK_NAME, taskName)} " +
+              log"interrupted: Attempting to kill Python Worker")
             env.destroyPythonWorker(
               pythonExec, workerModule, daemonModule, envVars.asScala.toMap, worker)
           } catch {
@@ -811,7 +832,7 @@ private[spark] object PythonRunner {
 private[spark] class PythonRunner(
     funcs: Seq[ChainedPythonFunctions], jobArtifactUUID: Option[String])
   extends BasePythonRunner[Array[Byte], Array[Byte]](
-    funcs, PythonEvalType.NON_UDF, Array(Array(0)), jobArtifactUUID) {
+    funcs, PythonEvalType.NON_UDF, Array(Array(0)), jobArtifactUUID, Map.empty) {
 
   protected override def newWriter(
       env: SparkEnv,
@@ -842,7 +863,7 @@ private[spark] class PythonRunner(
       startTime: Long,
       env: SparkEnv,
       worker: PythonWorker,
-      pid: Option[Long],
+      pid: Option[Int],
       releasedOrClosed: AtomicBoolean,
       context: TaskContext): Iterator[Array[Byte]] = {
     new ReaderIterator(

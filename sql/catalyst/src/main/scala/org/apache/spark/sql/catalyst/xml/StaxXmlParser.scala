@@ -32,11 +32,13 @@ import scala.util.control.NonFatal
 import scala.xml.SAXException
 
 import org.apache.commons.lang3.exception.ExceptionUtils
+import org.apache.hadoop.hdfs.BlockMissingException
+import org.apache.hadoop.security.AccessControlException
 
 import org.apache.spark.{SparkIllegalArgumentException, SparkUpgradeException}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.ExprUtils
+import org.apache.spark.sql.catalyst.expressions.{ExprUtils, GenericInternalRow}
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, BadRecordException, DateFormatter, DropMalformedMode, FailureSafeParser, GenericArrayData, MapData, ParseMode, PartialResultArrayException, PartialResultException, PermissiveMode, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.LegacyDateFormats.FAST_DATE_FORMAT
 import org.apache.spark.sql.catalyst.xml.StaxXmlParser.convertStream
@@ -327,9 +329,9 @@ class StaxXmlParser(
 
     if (valuesMap.isEmpty) {
       // Return an empty row with all nested elements by the schema set to null.
-      InternalRow.fromSeq(Seq.fill(schema.fieldNames.length)(null))
+      new GenericInternalRow(Array.fill[Any](schema.length)(null))
     } else {
-      InternalRow.fromSeq(row.toIndexedSeq)
+      new GenericInternalRow(row)
     }
   }
 
@@ -397,8 +399,7 @@ class StaxXmlParser(
                     row(anyIndex) = values :+ newValue
                 }
               } else {
-                StaxXmlParserUtils.skipChildren(parser)
-                StaxXmlParserUtils.skipNextEndElement(parser, field, options)
+                StaxXmlParserUtils.skipChildren(parser, field, options)
               }
           }
         } catch {
@@ -431,9 +432,9 @@ class StaxXmlParser(
     }
 
     if (badRecordException.isEmpty) {
-      InternalRow.fromSeq(newRow.toIndexedSeq)
+      new GenericInternalRow(newRow)
     } else {
-      throw PartialResultException(InternalRow.fromSeq(newRow.toIndexedSeq),
+      throw PartialResultException(new GenericInternalRow(newRow),
         badRecordException.get)
     }
   }
@@ -605,7 +606,7 @@ class StaxXmlParser(
         }
       case None => // do nothing
     }
-    InternalRow.fromSeq(row.toIndexedSeq)
+    new GenericInternalRow(row)
   }
 }
 
@@ -624,6 +625,10 @@ class XmlTokenizer(
   private var buffer = new StringBuilder()
   private val startTag = s"<${options.rowTag}>"
   private val endTag = s"</${options.rowTag}>"
+  private val commentStart = s"<!--"
+  private val commentEnd = s"-->"
+  private val cdataStart = s"<![CDATA["
+  private val cdataEnd = s"]]>"
 
     /**
    * Finds the start of the next record.
@@ -652,6 +657,10 @@ class XmlTokenizer(
             e)
         case NonFatal(e) =>
           ExceptionUtils.getRootCause(e) match {
+            case _: AccessControlException | _: BlockMissingException =>
+              reader.close()
+              reader = null
+              throw e
             case _: RuntimeException | _: IOException if options.ignoreCorruptFiles =>
               logWarning(
                 "Skipping the rest of" +
@@ -671,9 +680,35 @@ class XmlTokenizer(
       nextString
     }
 
+  private def readUntilMatch(end: String): Boolean = {
+    var i = 0
+    while (true) {
+      val cOrEOF = reader.read()
+      if (cOrEOF == -1) {
+        // End of file.
+        return false
+      }
+      val c = cOrEOF.toChar
+      if (c == end(i)) {
+        i += 1
+        if (i >= end.length) {
+          // Found the end string.
+          return true
+        }
+      } else {
+        i = 0
+      }
+    }
+    // Unreachable.
+    false
+  }
+
   private def readUntilStartElement(): Boolean = {
     currentStartTag = startTag
     var i = 0
+    var commentIdx = 0
+    var cdataIdx = 0
+
     while (true) {
       val cOrEOF = reader.read()
       if (cOrEOF == -1) { // || (i == 0 && getFilePosition() > end)) {
@@ -681,6 +716,31 @@ class XmlTokenizer(
         return false
       }
       val c = cOrEOF.toChar
+
+      if (c == commentStart(commentIdx)) {
+        if (commentIdx >= commentStart.length - 1) {
+          //  If a comment beigns we must ignore all character until its end
+          commentIdx = 0
+          readUntilMatch(commentEnd)
+        } else {
+          commentIdx += 1
+        }
+      } else {
+        commentIdx = 0
+      }
+
+      if (c == cdataStart(cdataIdx)) {
+        if (cdataIdx >= cdataStart.length - 1) {
+          //  If a CDATA beigns we must ignore all character until its end
+          cdataIdx = 0
+          readUntilMatch(cdataEnd)
+        } else {
+          cdataIdx += 1
+        }
+      } else {
+        cdataIdx = 0
+      }
+
       if (c == startTag(i)) {
         if (i >= startTag.length - 1) {
           // Found start tag.
@@ -708,6 +768,10 @@ class XmlTokenizer(
     // Index into the start or end tag that has matched so far
     var si = 0
     var ei = 0
+    // Index into the start of a comment tag that matched so far
+    var commentIdx = 0
+    // Index into the start of a CDATA tag that matched so far
+    var cdataIdx = 0
     // How many other start tags enclose the one that's started already?
     var depth = 0
     // Previously read character
@@ -729,6 +793,19 @@ class XmlTokenizer(
 
       val c = cOrEOF.toChar
       buffer.append(c)
+
+      if (c == commentStart(commentIdx)) {
+        if (commentIdx >= commentStart.length - 1) {
+          //  If a comment beigns we must ignore everything until its end
+          buffer.setLength(buffer.length - commentStart.length)
+          commentIdx = 0
+          readUntilMatch(commentEnd)
+        } else {
+          commentIdx += 1
+        }
+      } else {
+        commentIdx = 0
+      }
 
       if (c == '>' && prevC != '/') {
         canSelfClose = false

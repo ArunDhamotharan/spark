@@ -54,15 +54,18 @@ class SubstituteExecuteImmediate(val catalogManager: CatalogManager)
   def resolveVariable(e: Expression): Expression = {
 
     /**
-     * We know that the expression is either UnresolvedAttribute or Alias, as passed from the
-     * parser. If it is an UnresolvedAttribute, we look it up in the catalog and return it. If it
-     * is an Alias, we resolve the child and return an Alias with the same name.
+     * We know that the expression is either UnresolvedAttribute, Alias or Parameter, as passed from
+     * the parser. If it is an UnresolvedAttribute, we look it up in the catalog and return it. If
+     * it is an Alias, we resolve the child and return an Alias with the same name. If it is
+     * a Parameter, we leave it as is because the parameter belongs to another parameterized
+     * query and should be resolved later.
      */
     e match {
       case u: UnresolvedAttribute =>
         getVariableReference(u, u.nameParts)
       case a: Alias =>
         Alias(resolveVariable(a.child), a.name)()
+      case p: Parameter => p
       case other =>
         throw QueryCompilationErrors.unsupportedParameterExpression(other)
     }
@@ -91,7 +94,13 @@ class SubstituteExecuteImmediate(val catalogManager: CatalogManager)
         // Call eval with null value passed instead of a row.
         // This is ok as this is variable and invoking eval should
         // be independent of row value.
-        varReference.eval(null).toString
+        val varReferenceValue = varReference.eval(null)
+
+        if (varReferenceValue == null) {
+          throw QueryCompilationErrors.nullSQLStringExecuteImmediate(u.name)
+        }
+
+        varReferenceValue.toString
     }
   }
 
@@ -122,11 +131,14 @@ class SubstituteExecuteImmediate(val catalogManager: CatalogManager)
               resolveArguments(expressions))
           } else {
             val aliases = expressions.collect {
-              case (e: Alias) => e
+              case e: Alias => e
+              case u: UnresolvedAttribute => Alias(u, u.nameParts.last)()
             }
-            val nonAliases = expressions.filter(!_.isInstanceOf[Alias])
 
-            if (nonAliases.nonEmpty) {
+            if (aliases.size != expressions.size) {
+              val nonAliases = expressions.filter(attr =>
+                !attr.isInstanceOf[Alias] && !attr.isInstanceOf[UnresolvedAttribute])
+
               throw QueryCompilationErrors.invalidQueryAllParametersMustBeNamed(nonAliases)
             }
 

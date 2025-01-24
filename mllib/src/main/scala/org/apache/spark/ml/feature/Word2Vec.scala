@@ -211,6 +211,8 @@ class Word2VecModel private[ml] (
 
   import Word2VecModel._
 
+  private[ml] def this() = this(Identifiable.randomUID("w2v"), null)
+
   /**
    * Returns a dataframe with two fields, "word" and "vector", with "word" being a String and
    * and the vector the DenseVector that it is mapped to.
@@ -352,7 +354,7 @@ object Word2VecModel extends MLReadable[Word2VecModel] {
   class Word2VecModelWriter(instance: Word2VecModel) extends MLWriter {
 
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
 
       val wordVectors = instance.wordVectors.getVectors
       val dataPath = new Path(path, "data").toString
@@ -407,7 +409,7 @@ object Word2VecModel extends MLReadable[Word2VecModel] {
       val spark = sparkSession
       import spark.implicits._
 
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val (major, minor) = VersionUtils.majorMinorVersion(metadata.sparkVersion)
 
       val dataPath = new Path(path, "data").toString

@@ -19,7 +19,7 @@ from pyspark.sql.connect.utils import check_dependencies
 
 check_dependencies(__name__)
 
-from typing import Any, Optional, Union, cast
+from typing import Any, Dict, Optional, Union, cast
 import warnings
 
 from pyspark import _NoValue
@@ -49,6 +49,20 @@ class RuntimeConf:
 
     set.__doc__ = PySparkRuntimeConfig.set.__doc__
 
+    def _set_all(self, configs: Dict[str, Union[str, int, bool]], silent: bool) -> None:
+        conf_list = []
+        for key, value in configs.items():
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            elif isinstance(value, int):
+                value = str(value)
+            conf_list.append(proto.KeyValue(key=key, value=value))
+        op_set = proto.ConfigRequest.Set(pairs=conf_list, silent=silent)
+        operation = proto.ConfigRequest.Operation(set=op_set)
+        result = self._client.config(operation)
+        for warn in result.warnings:
+            warnings.warn(warn)
+
     def get(
         self, key: str, default: Union[Optional[str], _NoValueType] = _NoValue
     ) -> Optional[str]:
@@ -67,6 +81,19 @@ class RuntimeConf:
         return result.pairs[0][1]
 
     get.__doc__ = PySparkRuntimeConfig.get.__doc__
+
+    @property
+    def getAll(self) -> Dict[str, str]:
+        op_get_all = proto.ConfigRequest.GetAll()
+        operation = proto.ConfigRequest.Operation(get_all=op_get_all)
+        result = self._client.config(operation)
+        confs: Dict[str, str] = dict()
+        for key, value in result.pairs:
+            assert value is not None
+            confs[key] = value
+        return confs
+
+    getAll.__doc__ = PySparkRuntimeConfig.getAll.__doc__
 
     def unset(self, key: str) -> None:
         op_unset = proto.ConfigRequest.Unset(keys=[key])
@@ -87,8 +114,8 @@ class RuntimeConf:
             return False
         else:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={"arg_name": "result", "allowed_values": "'true' or 'false'"},
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={"arg_name": "result", "allowed_values": "'true' or 'false'"},
             )
 
     isModifiable.__doc__ = PySparkRuntimeConfig.isModifiable.__doc__
@@ -97,8 +124,8 @@ class RuntimeConf:
         """Assert that an object is of type str."""
         if not isinstance(obj, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={
+                errorClass="NOT_STR",
+                messageParameters={
                     "arg_name": identifier,
                     "arg_type": type(obj).__name__,
                 },
@@ -109,6 +136,7 @@ RuntimeConf.__doc__ = PySparkRuntimeConfig.__doc__
 
 
 def _test() -> None:
+    import os
     import sys
     import doctest
     from pyspark.sql import SparkSession as PySparkSession
@@ -116,7 +144,9 @@ def _test() -> None:
 
     globs = pyspark.sql.connect.conf.__dict__.copy()
     globs["spark"] = (
-        PySparkSession.builder.appName("sql.connect.conf tests").remote("local[4]").getOrCreate()
+        PySparkSession.builder.appName("sql.connect.conf tests")
+        .remote(os.environ.get("SPARK_CONNECT_TESTING_REMOTE", "local[4]"))
+        .getOrCreate()
     )
 
     (failure_count, test_count) = doctest.testmod(
